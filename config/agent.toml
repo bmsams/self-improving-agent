@@ -36,6 +36,9 @@ security_scan = 1.5
 enabled = false
 region = "us-east-1"
 memory_namespace = "self-improving-agent"
+# memory_id = ""           # Set by CDK stack output or env var
+# code_interpreter_id = "" # Set by CDK stack output or env var
+# gateway_id = ""          # Set if using AgentCore Gateway
 
 [safety]
 max_files_per_generation = 10

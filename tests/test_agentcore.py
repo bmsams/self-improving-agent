@@ -36,10 +36,12 @@ class TestAgentCoreConfig:
         monkeypatch.setenv("AGENTCORE_ENABLED", "false")
         monkeypatch.setenv("AWS_REGION", "eu-west-1")
         monkeypatch.setenv("AGENTCORE_MEMORY_NS", "test-agent")
+        monkeypatch.setenv("AGENTCORE_CODE_INTERPRETER_ID", "ci-test-123")
         config = AgentCoreConfig.from_env()
         assert config.enabled is False
         assert config.region == "eu-west-1"
         assert config.memory_namespace == "test-agent"
+        assert config.code_interpreter_id == "ci-test-123"
 
     def test_disabled_by_default_env(self, monkeypatch):
         monkeypatch.delenv("AGENTCORE_ENABLED", raising=False)

@@ -10,6 +10,11 @@ Integrates 6 AgentCore services:
 
 Each integration is optional — gracefully degrades if AWS credentials
 or specific services aren't available.
+
+Uses the official bedrock-agentcore SDK (<=0.1.5):
+- Memory: bedrock_agentcore.memory.MemoryClient
+- Code Interpreter: bedrock_agentcore.tools.code_interpreter_client.CodeInterpreter
+- Runtime: bedrock_agentcore.runtime.BedrockAgentCoreApp
 """
 
 from __future__ import annotations
@@ -35,7 +40,8 @@ class AgentCoreConfig:
     enabled: bool = True
     region: str = "us-east-1"
     memory_namespace: str = "self-improving-agent"
-    memory_id: Optional[str] = None  # Auto-created if None
+    memory_id: Optional[str] = None
+    code_interpreter_id: Optional[str] = None
     gateway_id: Optional[str] = None
     policy_store_id: Optional[str] = None
     observability_enabled: bool = True
@@ -50,6 +56,7 @@ class AgentCoreConfig:
             region=os.environ.get("AWS_REGION", "us-east-1"),
             memory_namespace=os.environ.get("AGENTCORE_MEMORY_NS", "self-improving-agent"),
             memory_id=os.environ.get("AGENTCORE_MEMORY_ID"),
+            code_interpreter_id=os.environ.get("AGENTCORE_CODE_INTERPRETER_ID"),
             gateway_id=os.environ.get("AGENTCORE_GATEWAY_ID"),
             policy_store_id=os.environ.get("AGENTCORE_POLICY_STORE_ID"),
         )
@@ -69,17 +76,20 @@ def _get_boto_client(service: str, region: str):
 # 1. AGENTCORE MEMORY — Episodic memory for cross-generation learning
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+ACTOR_ID = "self-improving-agent"
+SESSION_ID = "improvement-loop"
+
+
 class AgentCoreMemory:
     """Manages long-term episodic memory via AgentCore Memory.
 
-    Stores:
-    - What improvements were attempted and their outcomes
-    - Which code patterns led to benchmark improvements
-    - Review feedback patterns (what gets accepted vs rejected)
-    - Process evolution decisions from retrospectives
+    Uses the official bedrock-agentcore SDK MemoryClient with:
+    - create_event() to store generation outcomes and review patterns
+    - list_events() to retrieve past events with payloads
+    - get_last_k_turns() to recall recent conversation context
 
-    This replaces the flat-file evolution_log with a searchable,
-    persistent memory that survives across sessions and deployments.
+    Gracefully degrades to empty results when the SDK or AWS
+    credentials are not available.
     """
 
     def __init__(self, config: AgentCoreConfig):
@@ -92,12 +102,9 @@ class AgentCoreMemory:
         """Lazy-load the AgentCore Memory client."""
         if self._client is None:
             try:
-                from bedrock_agentcore.memory import AgentCoreMemoryClient
-                self._client = AgentCoreMemoryClient(
-                    region_name=self.config.region
-                )
+                from bedrock_agentcore.memory import MemoryClient
+                self._client = MemoryClient(region_name=self.config.region)
             except ImportError:
-                # Fall back to boto3
                 self._client = _get_boto_client(
                     "bedrock-agentcore", self.config.region
                 )
@@ -112,13 +119,7 @@ class AgentCoreMemory:
         review_summary: str,
         files_changed: list[str],
     ) -> None:
-        """Store the outcome of one improvement generation as episodic memory.
-
-        This enables the agent to learn patterns like:
-        - "Refactoring tests usually gets accepted"
-        - "Large multi-file changes tend to regress benchmarks"
-        - "Adding type hints consistently improves the type_check benchmark"
-        """
+        """Store the outcome of one improvement generation as episodic memory."""
         episode = {
             "type": "generation_outcome",
             "generation": generation,
@@ -131,18 +132,12 @@ class AgentCoreMemory:
         }
 
         try:
-            if self.client:
-                # Use AgentCore Memory's long-term storage
-                self.client.add_memory(
-                    memoryId=self._memory_id,
-                    namespace=self.config.memory_namespace,
-                    content=json.dumps(episode),
-                    metadata={
-                        "episode_type": "generation_outcome",
-                        "generation": str(generation),
-                        "accepted": str(accepted),
-                        "delta": str(round(benchmark_delta, 2)),
-                    },
+            if self.client and self._memory_id:
+                self.client.create_event(
+                    memory_id=self._memory_id,
+                    actor_id=ACTOR_ID,
+                    session_id=f"gen-{generation}",
+                    messages=[(json.dumps(episode), "assistant")],
                 )
                 logger.info(f"Stored generation {generation} episode to AgentCore Memory")
         except Exception as e:
@@ -155,11 +150,7 @@ class AgentCoreMemory:
         was_valid: bool,
         description: str,
     ) -> None:
-        """Store review finding patterns for meta-learning.
-
-        Helps the Retrospective agent understand which review
-        criteria are most predictive of actual regressions.
-        """
+        """Store review finding patterns for meta-learning."""
         pattern = {
             "type": "review_pattern",
             "category": finding_category,
@@ -170,17 +161,12 @@ class AgentCoreMemory:
         }
 
         try:
-            if self.client:
-                self.client.add_memory(
-                    memoryId=self._memory_id,
-                    namespace=self.config.memory_namespace,
-                    content=json.dumps(pattern),
-                    metadata={
-                        "episode_type": "review_pattern",
-                        "category": finding_category,
-                        "severity": finding_severity,
-                        "valid": str(was_valid),
-                    },
+            if self.client and self._memory_id:
+                self.client.create_event(
+                    memory_id=self._memory_id,
+                    actor_id=ACTOR_ID,
+                    session_id="review-patterns",
+                    messages=[(json.dumps(pattern), "assistant")],
                 )
         except Exception as e:
             logger.warning(f"AgentCore Memory write failed (non-fatal): {e}")
@@ -188,52 +174,67 @@ class AgentCoreMemory:
     async def recall_similar_attempts(
         self, current_plan: str, limit: int = 5
     ) -> list[dict]:
-        """Recall past attempts similar to the current plan.
+        """Recall past attempts by listing recent events.
 
-        Uses AgentCore Memory's semantic search to find relevant
-        past experiences, so the Builder can avoid repeating failures
-        and the Reviewer can calibrate expectations.
+        Uses list_events() to retrieve stored generation outcomes,
+        then filters client-side for relevance to the current plan.
         """
         try:
-            if self.client:
-                results = self.client.search_memory(
-                    memoryId=self._memory_id,
-                    namespace=self.config.memory_namespace,
-                    query=current_plan,
-                    maxResults=limit,
+            if self.client and self._memory_id:
+                events = self.client.list_events(
+                    memory_id=self._memory_id,
+                    actor_id=ACTOR_ID,
+                    session_id=SESSION_ID,
+                    max_results=limit * 3,
+                    include_payload=True,
                 )
-                return [
-                    json.loads(r.get("content", "{}"))
-                    for r in results.get("memories", [])
-                ]
+                results = []
+                for event in events or []:
+                    payload = event.get("payload", [{}])
+                    if payload:
+                        blob = payload[0].get("blob", "")
+                        try:
+                            data = json.loads(blob) if isinstance(blob, str) else blob
+                            if data.get("type") == "generation_outcome":
+                                results.append(data)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                return results[:limit]
         except Exception as e:
-            logger.warning(f"AgentCore Memory search failed (non-fatal): {e}")
+            logger.warning(f"AgentCore Memory recall failed (non-fatal): {e}")
         return []
 
     async def get_success_patterns(self, limit: int = 10) -> list[dict]:
         """Retrieve the most successful improvement patterns.
 
-        Filters episodic memory for accepted changes with positive
+        Lists events and filters for accepted changes with positive
         benchmark deltas, ordered by impact magnitude.
         """
         try:
-            if self.client:
-                results = self.client.search_memory(
-                    memoryId=self._memory_id,
-                    namespace=self.config.memory_namespace,
-                    query="accepted improvement positive benchmark delta",
-                    maxResults=limit,
-                    filters={"accepted": "True"},
+            if self.client and self._memory_id:
+                events = self.client.list_events(
+                    memory_id=self._memory_id,
+                    actor_id=ACTOR_ID,
+                    session_id=SESSION_ID,
+                    max_results=50,
+                    include_payload=True,
                 )
-                episodes = [
-                    json.loads(r.get("content", "{}"))
-                    for r in results.get("memories", [])
-                ]
+                episodes = []
+                for event in events or []:
+                    payload = event.get("payload", [{}])
+                    if payload:
+                        blob = payload[0].get("blob", "")
+                        try:
+                            data = json.loads(blob) if isinstance(blob, str) else blob
+                            if data.get("accepted") and data.get("benchmark_delta", 0) > 0:
+                                episodes.append(data)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
                 return sorted(
                     episodes,
                     key=lambda e: e.get("benchmark_delta", 0),
                     reverse=True,
-                )
+                )[:limit]
         except Exception as e:
             logger.warning(f"AgentCore Memory search failed (non-fatal): {e}")
         return []
@@ -246,16 +247,12 @@ class AgentCoreMemory:
 class AgentCoreCodeInterpreter:
     """Executes benchmarks and tests in isolated AgentCore sandboxes.
 
-    Benefits over local execution:
-    - Complete session isolation (can't corrupt host)
-    - Resource limits (CPU/memory caps per session)
-    - Automatic cleanup after execution
-    - Audit trail via CloudTrail
-    - Safe execution of agent-generated code
+    Uses the official bedrock-agentcore SDK CodeInterpreter with:
+    - start(identifier=...) to create a session
+    - invoke("executeCode", {...}) to run code
+    - stop() to clean up
 
-    Critical for the self-improving agent because the Builder
-    generates code that gets executed — sandboxing prevents
-    runaway or malicious modifications from damaging the system.
+    Gracefully degrades to local execution when unavailable.
     """
 
     def __init__(self, config: AgentCoreConfig):
@@ -267,12 +264,10 @@ class AgentCoreCodeInterpreter:
         """Lazy-load the Code Interpreter client."""
         if self._client is None:
             try:
-                from bedrock_agentcore.tools.code_interpreter import (
-                    CodeInterpreterClient,
+                from bedrock_agentcore.tools.code_interpreter_client import (
+                    CodeInterpreter,
                 )
-                self._client = CodeInterpreterClient(
-                    region_name=self.config.region
-                )
+                self._client = CodeInterpreter(self.config.region)
             except ImportError:
                 self._client = _get_boto_client(
                     "bedrock-agentcore", self.config.region
@@ -282,13 +277,7 @@ class AgentCoreCodeInterpreter:
     async def run_benchmarks_sandboxed(
         self, project_path: str, benchmark_script: str
     ) -> dict:
-        """Run benchmark suite in an isolated sandbox.
-
-        Instead of executing `pytest` directly on the host, we upload
-        the project to the Code Interpreter sandbox and run there.
-        This prevents the agent from gaming benchmarks by modifying
-        the benchmark runner itself.
-        """
+        """Run benchmark suite in an isolated sandbox."""
         code = f"""
 import subprocess
 import json
@@ -318,31 +307,38 @@ print(json.dumps({{
 }}))
 """
         try:
-            if self.client:
-                session_id = f"bench-{uuid.uuid4().hex[:8]}"
-                response = self.client.execute_code(
-                    sessionId=session_id,
-                    code=code,
-                    language="python",
-                )
-                output = response.get("output", "")
+            if self.client and self.config.code_interpreter_id:
+                # Use official SDK pattern: start session, invoke, stop
                 try:
-                    return json.loads(output)
-                except json.JSONDecodeError:
-                    return {"raw_output": output, "error": "JSON parse failed"}
+                    from bedrock_agentcore.tools.code_interpreter_client import (
+                        CodeInterpreter,
+                    )
+                    ci = CodeInterpreter(self.config.region)
+                    ci.start(identifier=self.config.code_interpreter_id)
+                    response = ci.invoke(
+                        "executeCode",
+                        {"code": code, "language": "python", "clearContext": True},
+                    )
+                    output = ""
+                    for event in response.get("stream", []):
+                        result = event.get("result", {})
+                        structured = result.get("structuredContent", {})
+                        output = structured.get("stdout", "")
+                    ci.stop()
+                    try:
+                        return json.loads(output)
+                    except json.JSONDecodeError:
+                        return {"raw_output": output, "error": "JSON parse failed"}
+                except ImportError:
+                    # Fallback to boto3 generic client
+                    pass
         except Exception as e:
             logger.warning(f"AgentCore Code Interpreter failed (non-fatal): {e}")
 
-        # Fallback: return empty result (local execution will be used)
         return {"fallback": True, "reason": "Code Interpreter unavailable"}
 
     async def validate_generated_code(self, code: str) -> dict:
-        """Validate agent-generated code in a sandbox before applying.
-
-        Runs syntax check, import validation, and basic static analysis
-        in isolation. This is an extra safety layer before the Builder's
-        code touches the actual repository.
-        """
+        """Validate agent-generated code in a sandbox before applying."""
         validation_code = f"""
 import ast
 import sys
@@ -384,14 +380,30 @@ if results["syntax_valid"]:
 print(json.dumps(results))
 """
         try:
-            if self.client:
-                response = self.client.execute_code(
-                    sessionId=f"validate-{uuid.uuid4().hex[:8]}",
-                    code=validation_code,
-                    language="python",
-                )
-                output = response.get("output", "")
-                return json.loads(output)
+            if self.client and self.config.code_interpreter_id:
+                try:
+                    from bedrock_agentcore.tools.code_interpreter_client import (
+                        CodeInterpreter,
+                    )
+                    ci = CodeInterpreter(self.config.region)
+                    ci.start(identifier=self.config.code_interpreter_id)
+                    response = ci.invoke(
+                        "executeCode",
+                        {
+                            "code": validation_code,
+                            "language": "python",
+                            "clearContext": True,
+                        },
+                    )
+                    output = ""
+                    for event in response.get("stream", []):
+                        result = event.get("result", {})
+                        structured = result.get("structuredContent", {})
+                        output = structured.get("stdout", "")
+                    ci.stop()
+                    return json.loads(output)
+                except ImportError:
+                    pass
         except Exception as e:
             logger.warning(f"Code validation sandbox failed (non-fatal): {e}")
 
@@ -405,15 +417,9 @@ print(json.dumps(results))
 class AgentCoreObservability:
     """Traces every agent decision through OpenTelemetry.
 
-    Creates spans for:
-    - Each generation cycle (parent span)
-    - Individual phases (benchmark, plan, implement, review, etc.)
-    - LLM calls (token usage, latency, model)
-    - Git operations (branch, commit, merge/reject)
-    - Benchmark results (scores, deltas)
-
-    Data flows to CloudWatch dashboards and is compatible with
-    Datadog, Dynatrace, LangSmith, etc.
+    When deployed on AgentCore Runtime, the container is launched with
+    `opentelemetry-instrument` which auto-configures OTLP export to
+    CloudWatch. Locally, falls back to ConsoleSpanExporter.
     """
 
     def __init__(self, config: AgentCoreConfig):
@@ -423,7 +429,7 @@ class AgentCoreObservability:
         self._initialized = False
 
     def initialize(self) -> None:
-        """Set up OpenTelemetry with AgentCore exporter."""
+        """Set up OpenTelemetry tracing."""
         if self._initialized:
             return
 
@@ -435,17 +441,21 @@ class AgentCoreObservability:
                 ConsoleSpanExporter,
             )
 
-            # In production, use AgentCore's OTLP exporter:
-            # from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
-            #     OTLPSpanExporter,
-            # )
-            # exporter = OTLPSpanExporter(endpoint="agentcore-otlp-endpoint")
+            # When running on AgentCore Runtime, the opentelemetry-instrument
+            # wrapper auto-configures OTLP export. We only need to set up
+            # a provider if one isn't already configured.
+            existing = trace.get_tracer_provider()
+            if hasattr(existing, "get_tracer"):
+                # A provider is already configured (e.g., by otel-instrument)
+                self._tracer = existing.get_tracer("self-improving-agent")
+            else:
+                # Local dev: use console exporter
+                provider = TracerProvider()
+                processor = BatchSpanProcessor(ConsoleSpanExporter())
+                provider.add_span_processor(processor)
+                trace.set_tracer_provider(provider)
+                self._tracer = trace.get_tracer("self-improving-agent")
 
-            provider = TracerProvider()
-            processor = BatchSpanProcessor(ConsoleSpanExporter())
-            provider.add_span_processor(processor)
-            trace.set_tracer_provider(provider)
-            self._tracer = trace.get_tracer("self-improving-agent")
             self._trace_module = trace
             self._initialized = True
             logger.info("AgentCore Observability initialized (OpenTelemetry)")
@@ -538,18 +548,8 @@ class _NoOpSpan:
 class AgentCoreEvaluations:
     """Uses AgentCore Evaluations for quality assessment.
 
-    Built-in evaluators:
-    - Correctness: Does the code do what the spec says?
-    - Helpfulness: Does the change improve the codebase?
-    - Tool Selection Accuracy: Did the agent pick the right approach?
-    - Safety: No dangerous patterns introduced?
-
-    Custom evaluators:
-    - Benchmark Regression: Did scores go down?
-    - Spec Compliance: Does implementation match EARS requirements?
-    - Self-Consistency: Is the agent's reasoning coherent?
-
-    Results publish to CloudWatch for dashboards and alerting.
+    Provides local evaluation scoring as primary method, with
+    optional AgentCore Evaluations API for richer assessment.
     """
 
     def __init__(self, config: AgentCoreConfig):
@@ -572,11 +572,7 @@ class AgentCoreEvaluations:
         review: dict,
         benchmark_comparison: dict,
     ) -> dict:
-        """Run evaluations on a complete generation cycle.
-
-        Returns scores across multiple quality dimensions that feed
-        into the merge decision and retrospective analysis.
-        """
+        """Run evaluations on a complete generation cycle."""
         evaluation_input = {
             "generation": generation,
             "plan": plan,
@@ -590,10 +586,8 @@ class AgentCoreEvaluations:
             "regressions": benchmark_comparison.get("regressed", []),
         }
 
-        # Local evaluation when AgentCore Evaluations isn't available
         scores = self._local_evaluate(evaluation_input)
 
-        # Try AgentCore Evaluations for richer assessment
         try:
             if self.client:
                 response = self.client.create_evaluation(
@@ -621,17 +615,15 @@ class AgentCoreEvaluations:
         scores = {
             "correctness": 0.0,
             "helpfulness": 0.0,
-            "safety": 1.0,  # Default safe unless proven otherwise
+            "safety": 1.0,
             "spec_compliance": 0.0,
             "overall": 0.0,
         }
 
-        # Correctness: based on review score and benchmark stability
         review_score = input_data.get("review_score", 0)
         has_regressions = len(input_data.get("regressions", [])) > 0
         scores["correctness"] = review_score * (0.5 if has_regressions else 1.0)
 
-        # Helpfulness: based on benchmark improvement
         delta = input_data.get("benchmark_delta", 0)
         if delta > 10:
             scores["helpfulness"] = 0.9
@@ -642,7 +634,6 @@ class AgentCoreEvaluations:
         else:
             scores["helpfulness"] = 0.1
 
-        # Spec compliance: has tests and review approval
         has_tests = input_data.get("implementation_summary", {}).get(
             "test_files_added", 0
         ) > 0
@@ -651,7 +642,6 @@ class AgentCoreEvaluations:
             (0.5 if has_tests else 0.0) + (0.5 if approved else 0.0)
         )
 
-        # Overall weighted score
         scores["overall"] = (
             scores["correctness"] * 0.3
             + scores["helpfulness"] * 0.3
@@ -667,15 +657,7 @@ class AgentCoreEvaluations:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class AgentCoreGateway:
-    """Connects the agent to external tools via MCP through Gateway.
-
-    Registered tools:
-    - github_create_pr: Create real GitHub PRs
-    - github_list_issues: Find issues to work on
-    - github_get_review: Fetch human review feedback
-    - code_analysis: Static analysis via external services
-    - dependency_check: Vulnerability scanning
-    """
+    """Connects the agent to external tools via MCP through Gateway."""
 
     def __init__(self, config: AgentCoreConfig):
         self.config = config
@@ -744,21 +726,8 @@ class AgentCoreGateway:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class AgentCorePolicy:
-    """Enforces safety boundaries using Cedar policies via AgentCore.
+    """Enforces safety boundaries using Cedar policies via AgentCore."""
 
-    Policies prevent the agent from:
-    - Modifying benchmark definitions (gaming scores)
-    - Bypassing the review step
-    - Deleting test files
-    - Modifying safety-critical infrastructure
-    - Accessing files outside the project root
-    - Making more than N changes per generation
-
-    These are enforced at the Gateway level, intercepting tool calls
-    before they execute.
-    """
-
-    # Cedar policy definitions (natural language → Cedar format)
     SAFETY_POLICIES = [
         {
             "name": "no_benchmark_modification",
@@ -829,41 +798,29 @@ unless {
         agent_role: str,
         context: Optional[dict] = None,
     ) -> tuple[bool, str]:
-        """Check if an action is permitted by policy.
-
-        Returns (allowed, reason) tuple. This is called before
-        every file write/delete operation in the improvement loop.
-        """
+        """Check if an action is permitted by policy."""
         ctx = context or {}
 
-        # Local policy enforcement (works without AgentCore)
         if action == "file_write":
-            # Can't modify benchmark runner
             if "benchmarks/runner.py" in resource_path:
                 return False, "Policy: Cannot modify benchmark runner"
 
-            # Can't modify core safety logic
             if "core/loop.py" in resource_path and agent_role != "retrospective":
-                # Allow unless changing merge decision logic
                 pass
 
-            # Only retrospective can modify steering
             if (
                 resource_path.startswith("steering/")
                 or resource_path == "CLAUDE.md"
             ) and agent_role != "retrospective":
                 return False, "Policy: Only Retrospective agent can modify steering"
 
-            # File change limit
             if ctx.get("files_changed_count", 0) > 10:
                 return False, "Policy: Maximum 10 file changes per generation"
 
         elif action == "file_delete":
-            # Can't delete tests
             if resource_path.startswith("tests/"):
                 return False, "Policy: Cannot delete test files"
 
-            # Can't delete core infrastructure
             protected = [
                 "main.py", "CLAUDE.md", "pyproject.toml",
                 "src/core/models.py", "src/core/loop.py",
@@ -886,11 +843,7 @@ unless {
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class AgentCoreServices:
-    """Unified access to all AgentCore services.
-
-    Creates and manages the lifecycle of all service clients.
-    Gracefully degrades when services are unavailable.
-    """
+    """Unified access to all AgentCore services."""
 
     def __init__(self, config: Optional[AgentCoreConfig] = None):
         self.config = config or AgentCoreConfig.from_env()
@@ -914,7 +867,7 @@ class AgentCoreServices:
             "observability": self.observability._initialized,
             "evaluations": self.evaluations.client is not None,
             "gateway": self.config.gateway_id is not None,
-            "policy": True,  # Local policy always works
+            "policy": True,
         }
         logger.info(f"AgentCore health: {status}")
         return status
