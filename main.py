@@ -64,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     run_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
     run_p.add_argument("--dry-run", action="store_true", help="Run without file writes or git commits")
     run_p.add_argument("--no-safety", action="store_true", help="Disable safety guardrails (dev only)")
+    run_p.add_argument("--github", action="store_true", help="Enable GitHub remote operations")
+    run_p.add_argument("--github-auto", action="store_true", help="GitHub mode with auto-merge")
 
     # loop — continuous improvement
     loop_p = sub.add_parser("loop", help="Run continuous improvement loop")
@@ -77,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     loop_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
     loop_p.add_argument("--dry-run", action="store_true", help="Run without file writes or git commits")
     loop_p.add_argument("--no-safety", action="store_true", help="Disable safety guardrails (dev only)")
+    loop_p.add_argument("--github", action="store_true", help="Enable GitHub remote operations")
+    loop_p.add_argument("--github-auto", action="store_true", help="GitHub mode with auto-merge")
 
     # bench — run benchmarks
     sub.add_parser("bench", help="Run benchmark suite")

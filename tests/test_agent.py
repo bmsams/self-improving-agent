@@ -27,6 +27,7 @@ from src.core.config import (
     AgentSettings, load_config, validate_config, format_config,
 )
 from src.core.safety import SafetyValidator
+from src.git_ops.github import GitHubIntegration, GitHubConfig
 from src.agents.personas import get_persona, PERSONAS, AgentRole
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
@@ -1311,3 +1312,101 @@ class TestSafetyValidator:
                 "README.md", "# This is markdown\n"
             )
             assert allowed is True
+
+
+# ─── GitHub Integration Tests (Task 9) ──────────────────────────
+
+class TestGitHubIntegration:
+    """Tests for GitHub integration with mocked CLI responses."""
+
+    def test_github_config_defaults(self):
+        """Default config is disabled."""
+        config = GitHubConfig()
+        assert config.enabled is False
+        assert config.token == ""
+        assert config.repo == ""
+
+    def test_github_config_from_env(self):
+        """Config can be loaded from env vars."""
+        original_token = os.environ.get("GITHUB_TOKEN")
+        original_repo = os.environ.get("GITHUB_REPO")
+        original_enabled = os.environ.get("GITHUB_ENABLED")
+        try:
+            os.environ["GITHUB_TOKEN"] = "test-token"
+            os.environ["GITHUB_REPO"] = "owner/repo"
+            os.environ["GITHUB_ENABLED"] = "true"
+            config = GitHubConfig.from_env()
+            assert config.enabled is True
+            assert config.token == "test-token"
+            assert config.repo == "owner/repo"
+        finally:
+            for key, orig in [
+                ("GITHUB_TOKEN", original_token),
+                ("GITHUB_REPO", original_repo),
+                ("GITHUB_ENABLED", original_enabled),
+            ]:
+                if orig is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = orig
+
+    def test_push_branch_failure(self):
+        """push_branch returns False on failure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = GitHubConfig(enabled=True)
+            gh = GitHubIntegration(config, root)
+            # No git repo, no remote — should fail
+            result = gh.push_branch("test-branch")
+            assert result is False
+
+    def test_create_pr_failure(self):
+        """create_pr returns None on failure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = GitHubConfig(enabled=True)
+            gh = GitHubIntegration(config, root)
+            result = gh.create_pr("Test", "Body", "feature", "main")
+            assert result is None
+
+    def test_merge_pr_failure(self):
+        """merge_pr returns False on failure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = GitHubConfig(enabled=True)
+            gh = GitHubIntegration(config, root)
+            result = gh.merge_pr(999)
+            assert result is False
+
+    def test_close_pr_failure(self):
+        """close_pr returns False on failure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = GitHubConfig(enabled=True)
+            gh = GitHubIntegration(config, root)
+            result = gh.close_pr(999)
+            assert result is False
+
+    @patch("subprocess.run")
+    def test_push_branch_success(self, mock_run):
+        """push_branch returns True on success."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GitHubConfig(enabled=True)
+            gh = GitHubIntegration(config, Path(tmpdir))
+            result = gh.push_branch("improve/test")
+            assert result is True
+
+    @patch("subprocess.run")
+    def test_create_pr_success(self, mock_run):
+        """create_pr extracts PR number from URL."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="https://github.com/owner/repo/pull/42\n",
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GitHubConfig(enabled=True)
+            gh = GitHubIntegration(config, Path(tmpdir))
+            result = gh.create_pr("Test PR", "Body text", "improve/test")
+            assert result == 42
