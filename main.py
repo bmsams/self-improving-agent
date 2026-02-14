@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     run_p.add_argument("--auto-merge", action="store_true", help="Auto-merge without review gate")
     run_p.add_argument("--agentcore", action="store_true", help="Enable AWS Bedrock AgentCore services")
     run_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
+    run_p.add_argument("--dry-run", action="store_true", help="Run without file writes or git commits")
 
     # loop — continuous improvement
     loop_p = sub.add_parser("loop", help="Run continuous improvement loop")
@@ -63,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     loop_p.add_argument("--auto-merge", action="store_true", help="Auto-merge without review gate")
     loop_p.add_argument("--agentcore", action="store_true", help="Enable AWS Bedrock AgentCore services")
     loop_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
+    loop_p.add_argument("--dry-run", action="store_true", help="Run without file writes or git commits")
 
     # bench — run benchmarks
     sub.add_parser("bench", help="Run benchmark suite")
@@ -101,7 +103,8 @@ async def cmd_run(args: argparse.Namespace, root: Path) -> None:
     )
     llm = MockProvider() if args.mock else AnthropicProvider()
     ac_config = _make_agentcore_config(args)
-    loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config)
+    dry_run = getattr(args, "dry_run", False)
+    loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config, dry_run=dry_run)
 
     if ac_config.enabled:
         health = loop.ac.health_check()
@@ -125,7 +128,8 @@ async def cmd_loop(args: argparse.Namespace, root: Path) -> None:
     )
     llm = MockProvider() if args.mock else AnthropicProvider()
     ac_config = _make_agentcore_config(args)
-    loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config)
+    dry_run = getattr(args, "dry_run", False)
+    loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config, dry_run=dry_run)
     await loop.run_loop(max_generations=args.max_gen)
 
 

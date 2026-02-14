@@ -7,14 +7,18 @@ Benchmarks are defined as simple callables that return scores.
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import importlib
 import json
+import logging
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from src.core.models import BenchmarkResult, BenchmarkSuite
 
@@ -32,9 +36,10 @@ class BenchmarkDef:
 class BenchmarkRunner:
     """Runs benchmark suites and tracks results over time."""
 
-    def __init__(self, project_root: Path):
+    def __init__(self, project_root: Path, benchmark_timeout: int = 120):
         self.project_root = project_root
         self.history_file = project_root / ".benchmark_history.json"
+        self.benchmark_timeout = benchmark_timeout
         self.benchmarks: list[BenchmarkDef] = []
         self._register_defaults()
 
@@ -97,16 +102,20 @@ class BenchmarkRunner:
         self.benchmarks.append(benchmark)
 
     def run_all(self, git_sha: str = "") -> BenchmarkSuite:
-        """Run all registered benchmarks and return a suite result."""
+        """Run all registered benchmarks and return a suite result.
+
+        Each benchmark is subject to self.benchmark_timeout seconds.
+        """
         suite = BenchmarkSuite(
             suite_id=f"suite-{uuid.uuid4().hex[:8]}",
             git_sha=git_sha,
         )
         for bench in self.benchmarks:
             try:
-                result = bench.runner()
+                result = self._run_with_timeout(bench)
                 suite.results.append(result)
             except Exception as e:
+                logger.warning(f"Benchmark '{bench.name}' failed: {e}")
                 suite.results.append(BenchmarkResult(
                     benchmark_name=bench.name,
                     score=0.0,
@@ -117,6 +126,25 @@ class BenchmarkRunner:
                 ))
         self._save_history(suite)
         return suite
+
+    def _run_with_timeout(self, bench: BenchmarkDef) -> BenchmarkResult:
+        """Run a single benchmark with a timeout."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(bench.runner)
+            try:
+                return future.result(timeout=self.benchmark_timeout)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    f"Benchmark '{bench.name}' timed out after {self.benchmark_timeout}s"
+                )
+                return BenchmarkResult(
+                    benchmark_name=bench.name,
+                    score=0.0,
+                    max_score=bench.max_score,
+                    passed=False,
+                    duration_seconds=float(self.benchmark_timeout),
+                    details={"error": f"Timed out after {self.benchmark_timeout}s"},
+                )
 
     def run_single(self, name: str, git_sha: str = "") -> Optional[BenchmarkResult]:
         """Run a single benchmark by name."""

@@ -65,10 +65,12 @@ class ImprovementLoop:
         llm: LLMProvider,
         project_root: Optional[Path] = None,
         agentcore_config: Optional[AgentCoreConfig] = None,
+        dry_run: bool = False,
     ):
         self.config = config
         self.llm = llm
         self.root = project_root or config.project_root
+        self.dry_run = dry_run
         self.git = GitOps(self.root)
         self.benchmarks = BenchmarkRunner(self.root)
         self.state = AgentState.load(self.root / config.state_file)
@@ -79,154 +81,187 @@ class ImprovementLoop:
     async def run_generation(self) -> EvolutionEntry:
         """Execute one complete improvement generation.
 
-        Integrates AWS Bedrock AgentCore at every phase:
-        - Observability: traces the full generation as a parent span
-        - Memory: recalls past attempts to inform planning
-        - Code Interpreter: sandboxed benchmark execution
-        - Policy: checks every file write against Cedar safety rules
-        - Evaluations: scores generation quality across 4 dimensions
-        - Memory (write): stores outcome for future recall
-
-        Returns the evolution entry describing what happened.
+        Each phase is individually wrapped with error handling. On failure:
+        - Logs full context (phase, input, error)
+        - Cleans up orphan git branches
+        - Records a failed EvolutionEntry
+        - Increments generation counter
+        - Returns the failed entry (does not raise)
         """
         gen = self.state.generation + 1
+        branch = None
         logger.info(f"═══ Generation {gen} starting ═══")
 
-        # ── AgentCore Observability: start generation trace ──
         gen_span = self.ac.observability.start_generation_span(gen)
 
-        # Phase 1: Benchmark current state
-        logger.info("Phase 1: Benchmarking current state...")
-        bench_span = self.ac.observability.start_phase_span("benchmark_baseline", gen_span)
-        baseline = self.benchmarks.run_all(git_sha=self.git.current_sha)
-        for r in baseline.results:
-            self.ac.observability.record_benchmark(bench_span, r.benchmark_name, r.score, r.max_score)
-        bench_span.end()
-        logger.info(f"Baseline score: {baseline.total_score:.1f}/{baseline.total_max:.1f}")
-
-        # ── AgentCore Memory: recall similar past attempts ──
-        plan_span = self.ac.observability.start_phase_span("plan", gen_span)
-
-        # Phase 2: Plan improvement (memory-informed)
-        logger.info("Phase 2: Planning improvement (memory-informed)...")
-        plan = await self._plan_improvement_with_memory(baseline)
-        plan_span.end()
-
-        # Phase 3: Implement on branch
-        logger.info("Phase 3: Implementing change...")
-        impl_span = self.ac.observability.start_phase_span("implement", gen_span)
-        branch = self.git.create_improvement_branch(plan.get("title", "unnamed"))
-        implementation = await self._implement_change(plan)
-
-        # ── AgentCore Policy: check each file write against Cedar rules ──
-        files_changed_count = 0
-        policy_blocked = False
-        for change in implementation.get("changes", []) + implementation.get("test_changes", []):
-            file_path = change.get("file", "")
-            allowed, reason = self.ac.policy.check_action(
-                action="file_write",
-                resource_path=file_path,
-                agent_role="builder",
-                context={"files_changed_count": files_changed_count},
-            )
-            if not allowed:
-                logger.warning(f"🛡️ Policy blocked: {reason} ({file_path})")
-                policy_blocked = True
-                break
-            files_changed_count += 1
-
-        if policy_blocked:
-            # Reject immediately if policy violation
-            self.git.switch_to_main()
-            entry = EvolutionEntry(
-                generation=gen,
-                action=plan.get("title", "policy-blocked"),
-                target_file="POLICY_VIOLATION",
-                rationale=reason,
-                benchmark_delta=0,
-                accepted=False,
-            )
-            self.ac.observability.record_decision(gen_span, "rejected", reason)
-            gen_span.end()
-            self.state.generation = gen
-            self.state.total_prs_created += 1
-            self.state.total_prs_rejected += 1
-            self.state.evolution_log.append(entry)
-            self.state.save(self.root / self.config.state_file)
-            logger.info(f"═══ Generation {gen} POLICY-BLOCKED ═══")
-            return entry
-
-        # ── AgentCore Code Interpreter: validate generated code in sandbox ──
-        for change in implementation.get("changes", []):
-            if change.get("file", "").endswith(".py"):
-                validation = await self.ac.code_interpreter.validate_generated_code(
-                    change.get("content", "")
+        # ── Phase 1: Benchmark baseline ──
+        try:
+            logger.info("Phase 1: Benchmarking current state...")
+            bench_span = self.ac.observability.start_phase_span("benchmark_baseline", gen_span)
+            baseline = self.benchmarks.run_all(git_sha=self.git.current_sha)
+            for r in baseline.results:
+                self.ac.observability.record_benchmark(
+                    bench_span, r.benchmark_name, r.score, r.max_score,
                 )
-                if not validation.get("fallback") and not validation.get("syntax_valid"):
-                    logger.warning(
-                        f"⚠️ Code validation failed for {change['file']}: "
-                        f"{validation.get('issues', [])}"
+            bench_span.end()
+            logger.info(f"Baseline score: {baseline.total_score:.1f}/{baseline.total_max:.1f}")
+        except Exception as e:
+            logger.error(f"Phase 1 (baseline benchmark) failed: {e}", exc_info=True)
+            return self._record_failure(gen, "benchmark_baseline", str(e), gen_span)
+
+        # ── Phase 2: Plan improvement ──
+        try:
+            plan_span = self.ac.observability.start_phase_span("plan", gen_span)
+            logger.info("Phase 2: Planning improvement (memory-informed)...")
+            plan = await self._plan_improvement_with_memory(baseline)
+            plan_span.end()
+        except Exception as e:
+            logger.error(f"Phase 2 (planning) failed: {e}", exc_info=True)
+            return self._record_failure(gen, "plan", str(e), gen_span)
+
+        # ── Phase 3: Implement on branch ──
+        try:
+            logger.info("Phase 3: Implementing change...")
+            impl_span = self.ac.observability.start_phase_span("implement", gen_span)
+            branch = self.git.create_improvement_branch(plan.get("title", "unnamed"))
+            implementation = await self._implement_change(plan)
+
+            # Policy check
+            files_changed_count = 0
+            policy_blocked = False
+            reason = ""
+            for change in implementation.get("changes", []) + implementation.get("test_changes", []):
+                file_path = change.get("file", "")
+                allowed, reason = self.ac.policy.check_action(
+                    action="file_write",
+                    resource_path=file_path,
+                    agent_role="builder",
+                    context={"files_changed_count": files_changed_count},
+                )
+                if not allowed:
+                    logger.warning(f"Policy blocked: {reason} ({file_path})")
+                    policy_blocked = True
+                    break
+                files_changed_count += 1
+
+            if policy_blocked:
+                self._cleanup_on_failure(branch)
+                entry = EvolutionEntry(
+                    generation=gen,
+                    action=plan.get("title", "policy-blocked"),
+                    target_file="POLICY_VIOLATION",
+                    rationale=reason,
+                    benchmark_delta=0,
+                    accepted=False,
+                )
+                self.ac.observability.record_decision(gen_span, "rejected", reason)
+                gen_span.end()
+                self.state.generation = gen
+                self.state.total_prs_created += 1
+                self.state.total_prs_rejected += 1
+                self.state.evolution_log.append(entry)
+                self.state.save(self.root / self.config.state_file)
+                logger.info(f"═══ Generation {gen} POLICY-BLOCKED ═══")
+                return entry
+
+            # Code validation
+            for change in implementation.get("changes", []):
+                if change.get("file", "").endswith(".py"):
+                    validation = await self.ac.code_interpreter.validate_generated_code(
+                        change.get("content", "")
                     )
+                    if not validation.get("fallback") and not validation.get("syntax_valid"):
+                        logger.warning(
+                            f"Code validation failed for {change['file']}: "
+                            f"{validation.get('issues', [])}"
+                        )
 
-        self._apply_changes(implementation)
-        sha = self.git.commit_changes(
-            f"[agent] {plan.get('improvement_type', 'feat')}: {plan.get('title', 'improvement')}"
-        )
-        impl_span.end()
+            if not self.dry_run:
+                self._apply_changes(implementation)
+                sha = self.git.commit_changes(
+                    f"[agent] {plan.get('improvement_type', 'feat')}: "
+                    f"{plan.get('title', 'improvement')}"
+                )
+            else:
+                sha = self.git.current_sha
+                logger.info("[DRY RUN] Skipping file writes and git commit")
 
-        # Phase 4: Create PR
-        pr = self.git.create_pr(
-            title=plan.get("title", "Self-improvement"),
-            description=self._format_pr_description(plan, baseline),
-        )
-        pr.benchmark_before = baseline
-        logger.info(f"Created {pr.pr_id}: {pr.title}")
+            impl_span.end()
+        except Exception as e:
+            logger.error(f"Phase 3 (implement) failed: {e}", exc_info=True)
+            self._cleanup_on_failure(branch)
+            return self._record_failure(gen, "implement", str(e), gen_span)
 
-        # Phase 5: Review
-        logger.info("Phase 5: Reviewing change...")
-        review_span = self.ac.observability.start_phase_span("review", gen_span)
-        review = await self._review_change(pr)
-        pr.reviews.append(review)
-        review_span.end()
+        # ── Phase 4: Create PR ──
+        try:
+            pr = self.git.create_pr(
+                title=plan.get("title", "Self-improvement"),
+                description=self._format_pr_description(plan, baseline),
+            )
+            pr.benchmark_before = baseline
+            logger.info(f"Created {pr.pr_id}: {pr.title}")
+        except Exception as e:
+            logger.error(f"Phase 4 (create PR) failed: {e}", exc_info=True)
+            self._cleanup_on_failure(branch)
+            return self._record_failure(gen, "create_pr", str(e), gen_span)
 
-        # Phase 6: Post-change benchmarks
-        logger.info("Phase 6: Post-change benchmarks...")
-        post_span = self.ac.observability.start_phase_span("benchmark_post", gen_span)
+        # ── Phase 5: Review ──
+        try:
+            logger.info("Phase 5: Reviewing change...")
+            review_span = self.ac.observability.start_phase_span("review", gen_span)
+            review = await self._review_change(pr)
+            pr.reviews.append(review)
+            review_span.end()
+        except Exception as e:
+            logger.error(f"Phase 5 (review) failed: {e}", exc_info=True)
+            self._cleanup_on_failure(branch)
+            return self._record_failure(gen, "review", str(e), gen_span)
 
-        # ── AgentCore Code Interpreter: run benchmarks in sandbox ──
-        sandbox_result = await self.ac.code_interpreter.run_benchmarks_sandboxed(
-            str(self.root), "from src.benchmarks.runner import BenchmarkRunner; print('ok')"
-        )
-        if sandbox_result.get("fallback"):
-            # Sandbox unavailable — run locally as before
+        # ── Phase 6: Post-change benchmarks ──
+        try:
+            logger.info("Phase 6: Post-change benchmarks...")
+            post_span = self.ac.observability.start_phase_span("benchmark_post", gen_span)
+
+            sandbox_result = await self.ac.code_interpreter.run_benchmarks_sandboxed(
+                str(self.root),
+                "from src.benchmarks.runner import BenchmarkRunner; print('ok')",
+            )
             post_bench = self.benchmarks.run_all(git_sha=sha)
-        else:
-            post_bench = self.benchmarks.run_all(git_sha=sha)
 
-        pr.benchmark_after = post_bench
-        comparison = self.benchmarks.compare(baseline, post_bench)
-        for r in post_bench.results:
-            self.ac.observability.record_benchmark(post_span, r.benchmark_name, r.score, r.max_score)
-        post_span.end()
+            pr.benchmark_after = post_bench
+            comparison = self.benchmarks.compare(baseline, post_bench)
+            for r in post_bench.results:
+                self.ac.observability.record_benchmark(
+                    post_span, r.benchmark_name, r.score, r.max_score,
+                )
+            post_span.end()
+        except Exception as e:
+            logger.error(f"Phase 6 (post benchmarks) failed: {e}", exc_info=True)
+            self._cleanup_on_failure(branch)
+            return self._record_failure(gen, "benchmark_post", str(e), gen_span)
 
-        # ── AgentCore Evaluations: quality scoring ──
-        eval_span = self.ac.observability.start_phase_span("evaluations", gen_span)
-        eval_scores = await self.ac.evaluations.evaluate_generation(
-            generation=gen,
-            plan=plan,
-            implementation=implementation,
-            review={"score": review.score, "approved": review.approved},
-            benchmark_comparison=comparison,
-        )
-        logger.info(
-            f"Eval scores: correctness={eval_scores.get('correctness', 0):.2f} "
-            f"helpfulness={eval_scores.get('helpfulness', 0):.2f} "
-            f"safety={eval_scores.get('safety', 0):.2f} "
-            f"overall={eval_scores.get('overall', 0):.2f}"
-        )
-        eval_span.end()
+        # ── Phase 7: Evaluations ──
+        try:
+            eval_span = self.ac.observability.start_phase_span("evaluations", gen_span)
+            eval_scores = await self.ac.evaluations.evaluate_generation(
+                generation=gen,
+                plan=plan,
+                implementation=implementation,
+                review={"score": review.score, "approved": review.approved},
+                benchmark_comparison=comparison,
+            )
+            logger.info(
+                f"Eval scores: correctness={eval_scores.get('correctness', 0):.2f} "
+                f"helpfulness={eval_scores.get('helpfulness', 0):.2f} "
+                f"safety={eval_scores.get('safety', 0):.2f} "
+                f"overall={eval_scores.get('overall', 0):.2f}"
+            )
+            eval_span.end()
+        except Exception as e:
+            logger.error(f"Phase 7 (evaluations) failed: {e}", exc_info=True)
+            eval_scores = {"overall": 0.0}
 
-        # Phase 7: Accept or reject
+        # ── Phase 8: Accept or reject ──
         accepted = self._make_merge_decision(pr, comparison)
         entry = EvolutionEntry(
             generation=gen,
@@ -240,7 +275,6 @@ class ImprovementLoop:
             accepted=accepted,
         )
 
-        # ── AgentCore Observability: record decision ──
         self.ac.observability.record_decision(
             gen_span,
             "merged" if accepted else "rejected",
@@ -249,26 +283,28 @@ class ImprovementLoop:
             f"eval_overall={eval_scores.get('overall', 0):.2f}",
         )
 
-        if accepted:
-            logger.info(f"✅ ACCEPTED — merging (delta: {comparison['total_delta']:+.1f})")
-            self.git.merge_pr(pr)
-            self.state.total_prs_merged += 1
-            self.state.current_best_score = max(
-                self.state.current_best_score, post_bench.total_score
-            )
+        if not self.dry_run:
+            if accepted:
+                logger.info(f"ACCEPTED — merging (delta: {comparison['total_delta']:+.1f})")
+                self.git.merge_pr(pr)
+                self.state.total_prs_merged += 1
+                self.state.current_best_score = max(
+                    self.state.current_best_score, post_bench.total_score
+                )
+            else:
+                logger.info(f"REJECTED — discarding (delta: {comparison['total_delta']:+.1f})")
+                self.git.reject_pr(pr)
+                self.state.total_prs_rejected += 1
         else:
-            logger.info(f"❌ REJECTED — discarding (delta: {comparison['total_delta']:+.1f})")
-            self.git.reject_pr(pr)
-            self.state.total_prs_rejected += 1
+            logger.info(f"[DRY RUN] Would {'merge' if accepted else 'reject'} PR")
 
-        # Phase 8: Update state and learn
+        # ── Phase 9: Update state and learn ──
         self.state.generation = gen
         self.state.total_prs_created += 1
         self.state.evolution_log.append(entry)
         self.state.benchmark_history.append(post_bench)
         self.state.save(self.root / self.config.state_file)
 
-        # ── AgentCore Memory: store generation outcome for future recall ──
         await self.ac.memory.store_generation_outcome(
             generation=gen,
             action=plan.get("title", "unknown"),
@@ -279,43 +315,92 @@ class ImprovementLoop:
                 c.get("file", "unknown") for c in implementation.get("changes", [])
             ],
         )
-        # Store review patterns for meta-learning
         for finding in review.findings:
             await self.ac.memory.store_review_pattern(
                 finding_category=finding.category,
                 finding_severity=finding.severity.value,
-                was_valid=not accepted,  # If rejected, findings were valid
+                was_valid=not accepted,
                 description=finding.description,
             )
 
-        # Phase 9: Retrospective (every 5 generations)
         if gen % 5 == 0:
             logger.info("Phase 9: Running retrospective...")
-            await self._run_retrospective()
+            try:
+                await self._run_retrospective()
+            except Exception as e:
+                logger.error(f"Retrospective failed (non-fatal): {e}")
 
-        # Tag generation
         self.git.tag_generation(gen, post_bench.total_score)
         gen_span.end()
 
         logger.info(f"═══ Generation {gen} complete ═══")
         return entry
 
+    def _cleanup_on_failure(self, branch: Optional[str] = None) -> None:
+        """Safely return to main branch and clean up orphan branches."""
+        try:
+            current = self.git.current_branch
+            if current not in ("main", "master"):
+                self.git.switch_to_main()
+            if branch and branch not in ("main", "master"):
+                self.git._run("branch", "-D", branch, check=False)
+        except Exception as cleanup_err:
+            logger.error(f"Cleanup failed: {cleanup_err}")
+
+    def _record_failure(
+        self, gen: int, phase: str, error: str, gen_span: object,
+    ) -> EvolutionEntry:
+        """Record a failed generation and return the entry."""
+        entry = EvolutionEntry(
+            generation=gen,
+            action=f"FAILED:{phase}",
+            target_file="N/A",
+            rationale=f"Phase '{phase}' failed: {error[:200]}",
+            benchmark_delta=0,
+            accepted=False,
+        )
+        self.ac.observability.record_decision(gen_span, "failed", f"{phase}: {error[:100]}")
+        gen_span.end()
+        self.state.generation = gen
+        self.state.total_prs_created += 1
+        self.state.total_prs_rejected += 1
+        self.state.evolution_log.append(entry)
+        self.state.save(self.root / self.config.state_file)
+        logger.info(f"═══ Generation {gen} FAILED at {phase} ═══")
+        return entry
+
     async def run_loop(self, max_generations: Optional[int] = None) -> None:
-        """Run the improvement loop continuously."""
+        """Run the improvement loop continuously with error recovery."""
         max_gen = max_generations or self.config.max_generations
+        consecutive_failures = 0
         while self.state.generation < max_gen:
             try:
                 entry = await self.run_generation()
                 logger.info(
                     f"Gen {entry.generation}: "
-                    f"{'✅' if entry.accepted else '❌'} "
+                    f"{'ACCEPTED' if entry.accepted else 'REJECTED'} "
                     f"{entry.action} "
                     f"(delta: {entry.benchmark_delta or 0:+.1f})"
                 )
+                if entry.action.startswith("FAILED:"):
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
             except Exception as e:
-                logger.error(f"Generation failed: {e}", exc_info=True)
-                self.git.switch_to_main()
-                time.sleep(1)
+                logger.error(f"Generation failed unexpectedly: {e}", exc_info=True)
+                self._cleanup_on_failure()
+                consecutive_failures += 1
+
+            if consecutive_failures >= 3:
+                logger.error(
+                    f"Stopping loop: {consecutive_failures} consecutive failures"
+                )
+                break
+
+            if consecutive_failures > 0:
+                backoff = min(30, 2 ** consecutive_failures)
+                logger.info(f"Backoff: waiting {backoff}s before next generation")
+                time.sleep(backoff)
 
     # ─── Private Methods ──────────────────────────────────────────
 

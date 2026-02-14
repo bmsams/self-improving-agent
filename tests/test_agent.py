@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
@@ -571,3 +572,172 @@ class TestSchemaValidation:
         data = {"error": "Failed to parse", "raw": "garbage"}
         result = ImprovementLoop._validate_response_schema(data, "architect")
         assert result == data
+
+
+# ─── Error Recovery Tests (Task 2) ──────────────────────────────
+
+def _make_test_project(root: Path) -> None:
+    """Create a minimal project structure for testing."""
+    (root / "README.md").write_text("# Test Project\n")
+    (root / "CLAUDE.md").write_text("# Steering\n")
+    (root / "pyproject.toml").write_text("[project]\nname='test'\n")
+    (root / ".gitignore").write_text(
+        ".benchmark_history.json\n.agent_state.json\n"
+        ".coverage\ncoverage.json\n.pytest_cache/\n__pycache__/\n"
+    )
+    src = root / "src"
+    src.mkdir()
+    (src / "__init__.py").write_text("")
+    (src / "core").mkdir()
+    (src / "core" / "__init__.py").write_text("")
+    tests = root / "tests"
+    tests.mkdir()
+    (tests / "__init__.py").write_text("")
+    (tests / "test_basic.py").write_text("def test_true():\n    assert True\n")
+
+
+class TestErrorRecovery:
+    """Tests for robust error recovery in the generation loop (Task 2)."""
+
+    @pytest.mark.asyncio
+    async def test_planning_failure_records_entry(self):
+        """If planning fails, record a failed EvolutionEntry."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _make_test_project(root)
+            GitOps(root)
+
+            class FailingMock:
+                call_count = 0
+                call_log: list = []
+
+                async def complete(self, system_prompt, user_message,
+                                   temperature=0.7, max_tokens=4096):
+                    self.call_count += 1
+                    if "Architect" in system_prompt:
+                        raise ConnectionError("LLM timeout during planning")
+                    return json.dumps({"response": "ok"})
+
+            config = AgentConfig(project_root=root, auto_merge=True,
+                                 benchmark_threshold=-50.0)
+            loop = ImprovementLoop(config, FailingMock(), root)
+            entry = await loop.run_generation()
+
+            assert entry.generation == 1
+            assert entry.accepted is False
+            assert "FAILED:plan" in entry.action
+            assert "LLM timeout" in entry.rationale
+
+    @pytest.mark.asyncio
+    async def test_implement_failure_cleans_up_branch(self):
+        """If implementation fails, clean up the orphan branch."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _make_test_project(root)
+            git = GitOps(root)
+
+            class FailOnBuildMock:
+                call_log: list = []
+
+                async def complete(self, system_prompt, user_message,
+                                   temperature=0.7, max_tokens=4096):
+                    if "Builder" in system_prompt:
+                        raise RuntimeError("Builder crashed")
+                    return json.dumps(MockProvider._mock_architect_response())
+
+            config = AgentConfig(project_root=root, auto_merge=True,
+                                 benchmark_threshold=-50.0)
+            loop = ImprovementLoop(config, FailOnBuildMock(), root)
+            entry = await loop.run_generation()
+
+            assert entry.accepted is False
+            assert "FAILED:implement" in entry.action
+            # Should be back on main branch
+            assert git.current_branch in ("main", "master")
+
+    @pytest.mark.asyncio
+    async def test_review_failure_records_entry(self):
+        """If review fails, record a failed entry and clean up."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _make_test_project(root)
+            GitOps(root)
+
+            class FailOnReviewMock:
+                call_log: list = []
+
+                async def complete(self, system_prompt, user_message,
+                                   temperature=0.7, max_tokens=4096):
+                    if "Reviewer" in system_prompt:
+                        raise TimeoutError("Review timed out")
+                    if "Architect" in system_prompt:
+                        return json.dumps(MockProvider._mock_architect_response())
+                    if "Builder" in system_prompt:
+                        return json.dumps(MockProvider._mock_builder_response())
+                    return json.dumps({"response": "ok"})
+
+            config = AgentConfig(project_root=root, auto_merge=True,
+                                 benchmark_threshold=-50.0)
+            loop = ImprovementLoop(config, FailOnReviewMock(), root)
+            entry = await loop.run_generation()
+
+            assert entry.accepted is False
+            assert "FAILED:review" in entry.action
+
+    @pytest.mark.asyncio
+    async def test_dry_run_no_file_writes(self):
+        """Dry run mode should skip file writes and git commits."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _make_test_project(root)
+            GitOps(root)
+
+            config = AgentConfig(project_root=root, auto_merge=True,
+                                 benchmark_threshold=-50.0)
+            mock = MockProvider()
+            loop = ImprovementLoop(config, mock, root, dry_run=True)
+            entry = await loop.run_generation()
+
+            assert entry.generation == 1
+            # Files from mock builder should NOT have been written
+            assert not (root / "src" / "__init__.py").read_text().startswith('"""Self-improving')
+
+    @pytest.mark.asyncio
+    async def test_cleanup_on_failure_returns_to_main(self):
+        """_cleanup_on_failure should return to main branch."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _make_test_project(root)
+            git = GitOps(root)
+            config = AgentConfig(project_root=root)
+            mock = MockProvider()
+            loop = ImprovementLoop(config, mock, root)
+
+            branch = git.create_improvement_branch("test-cleanup")
+            assert git.current_branch == branch
+
+            loop._cleanup_on_failure(branch)
+            assert git.current_branch in ("main", "master")
+
+    def test_benchmark_timeout(self):
+        """Benchmarks that exceed timeout return a failing result."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "src"
+            src.mkdir()
+            (src / "simple.py").write_text("x = 1\n")
+
+            runner = BenchmarkRunner(root, benchmark_timeout=1)
+
+            def slow_benchmark():
+                time.sleep(10)
+                return BenchmarkResult("slow", 100, 100, True, 10.0)
+
+            from src.benchmarks.runner import BenchmarkDef
+            runner.benchmarks = [
+                BenchmarkDef("slow", "test", 100.0, slow_benchmark)
+            ]
+            suite = runner.run_all()
+            assert len(suite.results) == 1
+            assert suite.results[0].passed is False
+            assert "Timed out" in suite.results[0].details.get("error", "")
