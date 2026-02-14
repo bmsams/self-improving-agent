@@ -29,6 +29,7 @@ from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
 from src.core.agentcore import AgentCoreServices, AgentCoreConfig
 from src.core.reporting import GenerationReport
+from src.core.safety import SafetyValidator
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class ImprovementLoop:
         project_root: Optional[Path] = None,
         agentcore_config: Optional[AgentCoreConfig] = None,
         dry_run: bool = False,
+        safety_enabled: bool = True,
     ):
         self.config = config
         self.llm = llm
@@ -75,6 +77,7 @@ class ImprovementLoop:
         self.git = GitOps(self.root)
         self.benchmarks = BenchmarkRunner(self.root)
         self.state = AgentState.load(self.root / config.state_file)
+        self.safety = SafetyValidator(self.root, enabled=safety_enabled)
 
         # Initialize AgentCore services (gracefully degrades if unavailable)
         self.ac = AgentCoreServices(agentcore_config)
@@ -190,6 +193,32 @@ class ImprovementLoop:
                             f"Code validation failed for {change['file']}: "
                             f"{validation.get('issues', [])}"
                         )
+
+            # Safety validation before writing
+            all_changes = implementation.get("changes", []) + implementation.get("test_changes", [])
+            safe, safety_issues = self.safety.validate_changes(all_changes)
+            if not safe:
+                logger.warning(f"Safety check blocked changes: {safety_issues}")
+                self._cleanup_on_failure(branch)
+                entry = EvolutionEntry(
+                    generation=gen,
+                    action=plan.get("title", "safety-blocked"),
+                    target_file="SAFETY_VIOLATION",
+                    rationale=f"Safety blocked: {'; '.join(safety_issues[:3])}",
+                    benchmark_delta=0,
+                    accepted=False,
+                )
+                self.ac.observability.record_decision(gen_span, "rejected", "safety violation")
+                gen_span.end()
+                self.state.generation = gen
+                self.state.total_prs_created += 1
+                self.state.total_prs_rejected += 1
+                self.state.evolution_log.append(entry)
+                self.state.save(self.root / self.config.state_file)
+                report.end_phase(phase_ts, error="safety violation")
+                self._save_report(report)
+                logger.info(f"═══ Generation {gen} SAFETY-BLOCKED ═══")
+                return entry
 
             if not self.dry_run:
                 self._apply_changes(implementation)

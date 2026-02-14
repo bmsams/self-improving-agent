@@ -26,6 +26,7 @@ from src.core.reporting import (
 from src.core.config import (
     AgentSettings, load_config, validate_config, format_config,
 )
+from src.core.safety import SafetyValidator
 from src.agents.personas import get_persona, PERSONAS, AgentRole
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
@@ -1183,3 +1184,130 @@ class TestConfiguration:
         assert "anthropic" in output
         assert "[benchmarks]" in output
         assert "[safety]" in output
+
+
+# ─── Safety Guardrail Tests (Task 8) ────────────────────────────
+
+class TestSafetyValidator:
+    """Tests for safety guardrails on self-modification."""
+
+    def test_safe_code_passes(self):
+        """Normal Python code passes validation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/utils.py", "def add(a, b):\n    return a + b\n"
+            )
+            assert allowed is True
+
+    def test_blocks_eval(self):
+        """eval() calls are blocked."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/utils.py", "result = eval(user_input)\n"
+            )
+            assert allowed is False
+            assert "eval" in reason
+
+    def test_blocks_exec(self):
+        """exec() calls are blocked."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/utils.py", "exec(code_string)\n"
+            )
+            assert allowed is False
+            assert "exec" in reason
+
+    def test_blocks_os_system(self):
+        """os.system() calls are blocked."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/utils.py", "import os\nos.system('rm -rf /')\n"
+            )
+            assert allowed is False
+            assert "os.system" in reason
+
+    def test_blocks_pickle(self):
+        """pickle.loads() calls are blocked."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/utils.py", "import pickle\ndata = pickle.loads(untrusted)\n"
+            )
+            assert allowed is False
+            assert "pickle" in reason
+
+    def test_blocks_protected_file(self):
+        """Cannot modify safety.py itself."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/core/safety.py", "# modified\n"
+            )
+            assert allowed is False
+            assert "protected" in reason.lower()
+
+    def test_blocks_merge_decision_override(self):
+        """Cannot redefine _make_merge_decision."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/core/loop.py",
+                "def _make_merge_decision(self, pr, comparison):\n    return True\n"
+            )
+            assert allowed is False
+            assert "_make_merge_decision" in reason
+
+    def test_blocks_syntax_errors(self):
+        """Python files with syntax errors are blocked."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/broken.py", "def broken(\n"
+            )
+            assert allowed is False
+            assert "Syntax error" in reason
+
+    def test_ignores_comments(self):
+        """Dangerous patterns in comments are allowed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "src/utils.py",
+                "# Don't use eval() in production\nx = 1\n"
+            )
+            assert allowed is True
+
+    def test_disabled_allows_everything(self):
+        """When disabled, all writes are allowed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir), enabled=False)
+            allowed, reason = sv.validate_before_write(
+                "src/core/safety.py", "eval(malicious_code)\n"
+            )
+            assert allowed is True
+
+    def test_validate_batch_changes(self):
+        """Validate a batch of changes, report all issues."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            changes = [
+                {"file": "src/good.py", "content": "x = 1\n"},
+                {"file": "src/bad.py", "content": "eval('danger')\n"},
+                {"file": "src/core/safety.py", "content": "# hacked\n"},
+            ]
+            all_valid, issues = sv.validate_changes(changes)
+            assert all_valid is False
+            assert len(issues) == 2  # bad.py + safety.py
+
+    def test_non_python_files_skip_syntax_check(self):
+        """Non-Python files skip syntax validation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sv = SafetyValidator(Path(tmpdir))
+            allowed, reason = sv.validate_before_write(
+                "README.md", "# This is markdown\n"
+            )
+            assert allowed is True

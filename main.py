@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     run_p.add_argument("--agentcore", action="store_true", help="Enable AWS Bedrock AgentCore services")
     run_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
     run_p.add_argument("--dry-run", action="store_true", help="Run without file writes or git commits")
+    run_p.add_argument("--no-safety", action="store_true", help="Disable safety guardrails (dev only)")
 
     # loop — continuous improvement
     loop_p = sub.add_parser("loop", help="Run continuous improvement loop")
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     loop_p.add_argument("--agentcore", action="store_true", help="Enable AWS Bedrock AgentCore services")
     loop_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
     loop_p.add_argument("--dry-run", action="store_true", help="Run without file writes or git commits")
+    loop_p.add_argument("--no-safety", action="store_true", help="Disable safety guardrails (dev only)")
 
     # bench — run benchmarks
     sub.add_parser("bench", help="Run benchmark suite")
@@ -150,7 +152,11 @@ async def cmd_run(args: argparse.Namespace, root: Path) -> None:
     llm = _make_provider(args)
     ac_config = _make_agentcore_config(args)
     dry_run = getattr(args, "dry_run", False)
-    loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config, dry_run=dry_run)
+    safety_enabled = not getattr(args, "no_safety", False)
+    loop = ImprovementLoop(
+        config, llm, root, agentcore_config=ac_config,
+        dry_run=dry_run, safety_enabled=safety_enabled,
+    )
 
     if ac_config.enabled:
         health = loop.ac.health_check()
@@ -175,7 +181,11 @@ async def cmd_loop(args: argparse.Namespace, root: Path) -> None:
     llm = _make_provider(args)
     ac_config = _make_agentcore_config(args)
     dry_run = getattr(args, "dry_run", False)
-    loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config, dry_run=dry_run)
+    safety_enabled = not getattr(args, "no_safety", False)
+    loop = ImprovementLoop(
+        config, llm, root, agentcore_config=ac_config,
+        dry_run=dry_run, safety_enabled=safety_enabled,
+    )
     await loop.run_loop(max_generations=args.max_gen)
 
 
