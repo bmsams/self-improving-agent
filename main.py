@@ -8,6 +8,8 @@ Usage:
     python main.py status               # Show current state
     python main.py agentcore-status     # Show AgentCore service health
     python main.py history              # Show evolution history
+    python main.py report N             # Show generation N report
+    python main.py dashboard            # Show aggregate dashboard
     python main.py reset                # Reset to generation 0
 
     Flags:
@@ -29,6 +31,7 @@ from src.core.models import AgentConfig, AgentState
 from src.core.loop import ImprovementLoop
 from src.core.providers import AnthropicProvider, BedrockProvider, MockProvider
 from src.core.agentcore import AgentCoreConfig, AgentCoreServices
+from src.core.reporting import load_report, load_all_reports, format_report, format_dashboard
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
 
@@ -84,6 +87,13 @@ def parse_args() -> argparse.Namespace:
     # history — show evolution log
     hist_p = sub.add_parser("history", help="Show evolution history")
     hist_p.add_argument("--last", type=int, default=20, help="Number of entries to show")
+
+    # report — show generation report
+    report_p = sub.add_parser("report", help="Show generation report")
+    report_p.add_argument("gen", type=int, help="Generation number to display")
+
+    # dashboard — show aggregate dashboard
+    sub.add_parser("dashboard", help="Show aggregate dashboard across all generations")
 
     # reset — reset state
     sub.add_parser("reset", help="Reset agent state to generation 0")
@@ -218,6 +228,23 @@ def cmd_reset(root: Path) -> None:
     print("Agent state reset to generation 0.")
 
 
+def cmd_report(root: Path, gen: int) -> None:
+    """Display a generation report."""
+    report_path = root / "reports" / f"gen-{gen}.json"
+    if not report_path.exists():
+        print(f"No report found for generation {gen}.")
+        print(f"Expected: {report_path}")
+        return
+    report = load_report(report_path)
+    print(format_report(report))
+
+
+def cmd_dashboard(root: Path) -> None:
+    """Display aggregate dashboard across all generations."""
+    reports = load_all_reports(root / "reports")
+    print(format_dashboard(reports))
+
+
 def cmd_agentcore_status() -> None:
     """Display AWS Bedrock AgentCore service health."""
     ac_config = AgentCoreConfig.from_env()
@@ -271,6 +298,10 @@ def main() -> None:
         cmd_agentcore_status()
     elif args.command == "history":
         cmd_history(root, args.last)
+    elif args.command == "report":
+        cmd_report(root, args.gen)
+    elif args.command == "dashboard":
+        cmd_dashboard(root)
     elif args.command == "reset":
         cmd_reset(root)
 

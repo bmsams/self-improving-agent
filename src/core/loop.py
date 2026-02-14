@@ -28,6 +28,7 @@ from src.agents.personas import get_persona, AgentPersona
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
 from src.core.agentcore import AgentCoreServices, AgentCoreConfig
+from src.core.reporting import GenerationReport
 
 logger = logging.getLogger(__name__)
 
@@ -93,10 +94,12 @@ class ImprovementLoop:
         logger.info(f"═══ Generation {gen} starting ═══")
 
         gen_span = self.ac.observability.start_generation_span(gen)
+        report = GenerationReport(generation=gen)
 
         # ── Phase 1: Benchmark baseline ──
         try:
             logger.info("Phase 1: Benchmarking current state...")
+            phase_ts = report.start_phase("benchmark_baseline")
             bench_span = self.ac.observability.start_phase_span("benchmark_baseline", gen_span)
             baseline = self.benchmarks.run_all(git_sha=self.git.current_sha)
             for r in baseline.results:
@@ -104,23 +107,35 @@ class ImprovementLoop:
                     bench_span, r.benchmark_name, r.score, r.max_score,
                 )
             bench_span.end()
+            report.end_phase(phase_ts)
+            report.benchmark_before = {
+                r.benchmark_name: r.score for r in baseline.results
+            }
             logger.info(f"Baseline score: {baseline.total_score:.1f}/{baseline.total_max:.1f}")
         except Exception as e:
             logger.error(f"Phase 1 (baseline benchmark) failed: {e}", exc_info=True)
+            report.end_phase(phase_ts, error=str(e))
+            self._save_report(report)
             return self._record_failure(gen, "benchmark_baseline", str(e), gen_span)
 
         # ── Phase 2: Plan improvement ──
         try:
+            phase_ts = report.start_phase("plan")
             plan_span = self.ac.observability.start_phase_span("plan", gen_span)
             logger.info("Phase 2: Planning improvement (memory-informed)...")
             plan = await self._plan_improvement_with_memory(baseline)
             plan_span.end()
+            report.end_phase(phase_ts)
+            report.action = plan.get("title", "unknown")
         except Exception as e:
             logger.error(f"Phase 2 (planning) failed: {e}", exc_info=True)
+            report.end_phase(phase_ts, error=str(e))
+            self._save_report(report)
             return self._record_failure(gen, "plan", str(e), gen_span)
 
         # ── Phase 3: Implement on branch ──
         try:
+            phase_ts = report.start_phase("implement")
             logger.info("Phase 3: Implementing change...")
             impl_span = self.ac.observability.start_phase_span("implement", gen_span)
             branch = self.git.create_improvement_branch(plan.get("title", "unnamed"))
@@ -187,38 +202,57 @@ class ImprovementLoop:
                 logger.info("[DRY RUN] Skipping file writes and git commit")
 
             impl_span.end()
+            report.end_phase(phase_ts)
+            report.files_changed = [
+                c.get("file", "unknown") for c in implementation.get("changes", [])
+            ]
         except Exception as e:
             logger.error(f"Phase 3 (implement) failed: {e}", exc_info=True)
+            report.end_phase(phase_ts, error=str(e))
             self._cleanup_on_failure(branch)
+            self._save_report(report)
             return self._record_failure(gen, "implement", str(e), gen_span)
 
         # ── Phase 4: Create PR ──
         try:
+            phase_ts = report.start_phase("create_pr")
             pr = self.git.create_pr(
                 title=plan.get("title", "Self-improvement"),
                 description=self._format_pr_description(plan, baseline),
             )
             pr.benchmark_before = baseline
+            report.end_phase(phase_ts)
             logger.info(f"Created {pr.pr_id}: {pr.title}")
         except Exception as e:
             logger.error(f"Phase 4 (create PR) failed: {e}", exc_info=True)
+            report.end_phase(phase_ts, error=str(e))
             self._cleanup_on_failure(branch)
+            self._save_report(report)
             return self._record_failure(gen, "create_pr", str(e), gen_span)
 
         # ── Phase 5: Review ──
         try:
+            phase_ts = report.start_phase("review")
             logger.info("Phase 5: Reviewing change...")
             review_span = self.ac.observability.start_phase_span("review", gen_span)
             review = await self._review_change(pr)
             pr.reviews.append(review)
             review_span.end()
+            report.end_phase(phase_ts)
+            report.review_approved = review.approved
+            report.review_score = review.score
+            report.review_findings_count = len(review.findings)
+            report.review_summary = review.summary
         except Exception as e:
             logger.error(f"Phase 5 (review) failed: {e}", exc_info=True)
+            report.end_phase(phase_ts, error=str(e))
             self._cleanup_on_failure(branch)
+            self._save_report(report)
             return self._record_failure(gen, "review", str(e), gen_span)
 
         # ── Phase 6: Post-change benchmarks ──
         try:
+            phase_ts = report.start_phase("benchmark_post")
             logger.info("Phase 6: Post-change benchmarks...")
             post_span = self.ac.observability.start_phase_span("benchmark_post", gen_span)
 
@@ -235,9 +269,18 @@ class ImprovementLoop:
                     post_span, r.benchmark_name, r.score, r.max_score,
                 )
             post_span.end()
+            report.end_phase(phase_ts)
+            report.benchmark_after = {
+                r.benchmark_name: r.score for r in post_bench.results
+            }
+            report.total_benchmark_delta = comparison.get("total_delta", 0)
+            for item in comparison.get("improved", []) + comparison.get("regressed", []):
+                report.benchmark_deltas[item["name"]] = item["delta"]
         except Exception as e:
             logger.error(f"Phase 6 (post benchmarks) failed: {e}", exc_info=True)
+            report.end_phase(phase_ts, error=str(e))
             self._cleanup_on_failure(branch)
+            self._save_report(report)
             return self._record_failure(gen, "benchmark_post", str(e), gen_span)
 
         # ── Phase 7: Evaluations ──
@@ -333,8 +376,27 @@ class ImprovementLoop:
         self.git.tag_generation(gen, post_bench.total_score)
         gen_span.end()
 
+        # Finalize and save report
+        report.accepted = accepted
+        report.decision_reason = (
+            f"delta={comparison.get('total_delta', 0):+.1f}, "
+            f"review={'approved' if review.approved else 'rejected'}"
+        )
+        report.finalize()
+        self._save_report(report)
+
         logger.info(f"═══ Generation {gen} complete ═══")
         return entry
+
+    def _save_report(self, report: GenerationReport) -> None:
+        """Save a generation report to the reports/ directory."""
+        try:
+            report.finalize()
+            reports_dir = self.root / "reports"
+            path = report.save(reports_dir)
+            logger.info(f"Generation report saved: {path}")
+        except Exception as e:
+            logger.warning(f"Failed to save generation report: {e}")
 
     def _cleanup_on_failure(self, branch: Optional[str] = None) -> None:
         """Safely return to main branch and clean up orphan branches."""

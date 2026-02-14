@@ -18,6 +18,10 @@ from src.core.models import (
 )
 from src.core.providers import MockProvider, TokenUsage, AnthropicProvider, BedrockProvider
 from src.core.loop import ImprovementLoop
+from src.core.reporting import (
+    GenerationReport, PhaseTimestamp, LLMCallRecord,
+    load_report, load_all_reports, format_report, format_dashboard,
+)
 from src.agents.personas import get_persona, PERSONAS, AgentRole
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
@@ -940,3 +944,138 @@ class TestTokenUsage:
 
         with pytest.raises(anthropic.AuthenticationError):
             await provider.complete("system", "user")
+
+
+# ─── Reporting Tests (Task 6) ────────────────────────────────────
+
+class TestGenerationReport:
+    """Tests for generation reporting and dashboard."""
+
+    def test_report_creation(self):
+        """Create a report and verify fields."""
+        report = GenerationReport(generation=1)
+        assert report.generation == 1
+        assert report.started_at != ""
+        assert report.finished_at == ""
+
+    def test_phase_tracking(self):
+        """Track phases with start/end timestamps."""
+        report = GenerationReport(generation=1)
+        phase = report.start_phase("benchmark_baseline")
+        assert phase.phase == "benchmark_baseline"
+        assert phase.start != ""
+
+        report.end_phase(phase)
+        assert phase.end != ""
+        assert phase.duration_seconds >= 0
+        assert len(report.phases) == 1
+
+    def test_phase_error_tracking(self):
+        """Track phase errors."""
+        report = GenerationReport(generation=1)
+        phase = report.start_phase("plan")
+        report.end_phase(phase, error="LLM timeout")
+        assert phase.error == "LLM timeout"
+        assert len(report.errors) == 1
+        assert "plan: LLM timeout" in report.errors[0]
+
+    def test_llm_call_recording(self):
+        """Record LLM calls with token counts and cost."""
+        report = GenerationReport(generation=1)
+        report.record_llm_call("architect", 1000, 500, 2.5, 0.01)
+        report.record_llm_call("builder", 2000, 1000, 3.0, 0.02)
+        assert len(report.llm_calls) == 2
+        assert report.total_input_tokens == 3000
+        assert report.total_output_tokens == 1500
+        assert abs(report.total_cost_usd - 0.03) < 0.001
+
+    def test_report_finalize(self):
+        """Finalize sets end time and duration."""
+        report = GenerationReport(generation=1)
+        report.finalize()
+        assert report.finished_at != ""
+        assert report.duration_seconds >= 0
+
+    def test_report_save_load_roundtrip(self):
+        """Save and load a report, verify data survives."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reports_dir = Path(tmpdir) / "reports"
+
+            report = GenerationReport(generation=5)
+            report.action = "add-type-hints"
+            report.accepted = True
+            report.total_benchmark_delta = 12.5
+            report.record_llm_call("architect", 100, 50, 1.0, 0.001)
+            phase = report.start_phase("plan")
+            report.end_phase(phase)
+            report.finalize()
+
+            path = report.save(reports_dir)
+            assert path.exists()
+
+            loaded = load_report(path)
+            assert loaded.generation == 5
+            assert loaded.action == "add-type-hints"
+            assert loaded.accepted is True
+            assert loaded.total_benchmark_delta == 12.5
+            assert len(loaded.llm_calls) == 1
+            assert len(loaded.phases) == 1
+
+    def test_load_all_reports(self):
+        """Load multiple reports from a directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reports_dir = Path(tmpdir) / "reports"
+            reports_dir.mkdir()
+
+            for i in range(3):
+                r = GenerationReport(generation=i + 1)
+                r.accepted = i % 2 == 0
+                r.finalize()
+                r.save(reports_dir)
+
+            reports = load_all_reports(reports_dir)
+            assert len(reports) == 3
+            assert reports[0].generation == 1
+            assert reports[2].generation == 3
+
+    def test_format_report_output(self):
+        """format_report produces readable output."""
+        report = GenerationReport(generation=3)
+        report.action = "fix-imports"
+        report.accepted = True
+        report.total_benchmark_delta = 5.0
+        report.benchmark_deltas = {"test_pass_rate": 3.0, "lint_score": 2.0}
+        report.review_approved = True
+        report.review_score = 0.85
+        report.files_changed = ["src/core/loop.py"]
+        report.finalize()
+
+        output = format_report(report)
+        assert "Generation 3" in output
+        assert "fix-imports" in output
+        assert "ACCEPTED" in output
+        assert "test_pass_rate" in output
+        assert "src/core/loop.py" in output
+
+    def test_format_dashboard_output(self):
+        """format_dashboard produces readable output."""
+        reports = []
+        for i in range(5):
+            r = GenerationReport(generation=i + 1)
+            r.accepted = i % 2 == 0
+            r.total_benchmark_delta = float(i)
+            r.total_cost_usd = 0.01 * (i + 1)
+            r.duration_seconds = 10.0
+            r.decision_reason = "delta positive" if r.accepted else "regression"
+            reports.append(r)
+
+        output = format_dashboard(reports)
+        assert "Dashboard" in output
+        assert "Generations:" in output
+        assert "Accepted:" in output
+        assert "Total cost:" in output
+
+    def test_format_dashboard_empty(self):
+        """Dashboard handles empty report list gracefully."""
+        output = format_dashboard([])
+        assert "No generation reports" in output
