@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "self-improving-agent"
-version = "0.1.0"
+version = "1.0.0"
 description = "A self-improving AI coding agent that reviews, benchmarks, and evolves its own codebase"
 requires-python = ">=3.11"
 dependencies = [
