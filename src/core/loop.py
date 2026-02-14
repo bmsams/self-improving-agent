@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Optional, Protocol
@@ -318,17 +319,54 @@ class ImprovementLoop:
 
     # ─── Private Methods ──────────────────────────────────────────
 
+    async def _llm_complete_json(
+        self,
+        system_prompt: str,
+        user_message: str,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        persona: str = "",
+    ) -> dict:
+        """Call LLM, parse JSON, validate schema, retry once on failure."""
+        response = await self.llm.complete(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        parsed = self._parse_json_response(response)
+
+        if "error" in parsed and "raw" in parsed:
+            logger.info("JSON parse failed — retrying with explicit JSON instruction")
+            retry_msg = (
+                "Your previous response could not be parsed as JSON. "
+                "Please respond with ONLY valid JSON, no explanation.\n\n"
+                f"Original request:\n{user_message}"
+            )
+            response = await self.llm.complete(
+                system_prompt=system_prompt,
+                user_message=retry_msg,
+                temperature=max(0.1, temperature - 0.2),
+                max_tokens=max_tokens,
+            )
+            parsed = self._parse_json_response(response)
+
+        if persona:
+            parsed = self._validate_response_schema(parsed, persona)
+
+        return parsed
+
     async def _plan_improvement(self, baseline: BenchmarkSuite) -> dict:
         """Use Architect persona to plan the next improvement (no memory)."""
         persona = get_persona(AgentRole.ARCHITECT)
         context = self._build_planning_context(baseline)
-        response = await self.llm.complete(
+        return await self._llm_complete_json(
             system_prompt=persona.get_full_prompt(),
             user_message=context,
             temperature=persona.temperature,
             max_tokens=persona.max_tokens,
+            persona="architect",
         )
-        return self._parse_json_response(response)
 
     async def _plan_improvement_with_memory(self, baseline: BenchmarkSuite) -> dict:
         """Use Architect persona + AgentCore Memory to plan improvement.
@@ -362,25 +400,25 @@ class ImprovementLoop:
                     f"files={pattern.get('files_changed', [])}\n"
                 )
 
-        response = await self.llm.complete(
+        return await self._llm_complete_json(
             system_prompt=persona.get_full_prompt(),
             user_message=context,
             temperature=persona.temperature,
             max_tokens=persona.max_tokens,
+            persona="architect",
         )
-        return self._parse_json_response(response)
 
     async def _implement_change(self, plan: dict) -> dict:
         """Use Builder persona to implement the planned change."""
         persona = get_persona(AgentRole.BUILDER)
         context = json.dumps(plan, indent=2)
-        response = await self.llm.complete(
+        return await self._llm_complete_json(
             system_prompt=persona.get_full_prompt(),
             user_message=f"Implement this improvement plan:\n\n{context}",
             temperature=persona.temperature,
             max_tokens=8192,
+            persona="builder",
         )
-        return self._parse_json_response(response)
 
     async def _review_change(self, pr: PullRequest) -> ReviewResult:
         """Use Reviewer persona to review the PR."""
@@ -392,13 +430,13 @@ class ImprovementLoop:
             f"**Files Changed**: {', '.join(pr.files_changed)}\n\n"
             f"## Diff\n```\n{diff[:8000]}\n```"
         )
-        response = await self.llm.complete(
+        review_data = await self._llm_complete_json(
             system_prompt=persona.get_full_prompt(),
             user_message=f"Review this pull request:\n\n{context}",
             temperature=persona.temperature,
             max_tokens=persona.max_tokens,
+            persona="reviewer",
         )
-        review_data = self._parse_json_response(response)
         return self._build_review_result(pr.pr_id, review_data)
 
     async def _run_retrospective(self) -> None:
@@ -438,13 +476,12 @@ class ImprovementLoop:
         health = self.ac.health_check()
         context += f"\n## AgentCore Services Health: {health}\n"
 
-        response = await self.llm.complete(
+        retro = await self._llm_complete_json(
             system_prompt=persona.get_full_prompt(),
             user_message=f"Analyze our progress and recommend process changes:\n\n{context}",
             temperature=persona.temperature,
             max_tokens=persona.max_tokens,
         )
-        retro = self._parse_json_response(response)
         logger.info(f"Retrospective insights: {json.dumps(retro, indent=2)}")
 
     def _apply_changes(self, implementation: dict) -> None:
@@ -547,17 +584,136 @@ class ImprovementLoop:
 
     @staticmethod
     def _parse_json_response(response: str) -> dict:
-        """Extract JSON from an LLM response, handling markdown fences."""
+        """Extract JSON from an LLM response, handling real-world edge cases.
+
+        Handles: markdown fences (```json and ```), leading/trailing text,
+        multiple JSON blocks (takes first valid), completely missing JSON.
+        """
         text = response.strip()
-        # Strip markdown code fences
-        if "```json" in text:
-            text = text.split("```json", 1)[1]
-            text = text.split("```", 1)[0]
-        elif "```" in text:
-            text = text.split("```", 1)[1]
-            text = text.split("```", 1)[0]
+
+        # Strategy 1: Extract from ```json ... ``` fences
+        json_fence = re.search(r"```json\s*\n?(.*?)```", text, re.DOTALL)
+        if json_fence:
+            try:
+                return json.loads(json_fence.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 2: Extract from ``` ... ``` fences (no language tag)
+        plain_fence = re.search(r"```\s*\n?(.*?)```", text, re.DOTALL)
+        if plain_fence:
+            try:
+                return json.loads(plain_fence.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: Find first valid JSON object by brace matching
+        parsed = ImprovementLoop._extract_first_json_object(text)
+        if parsed is not None:
+            return parsed
+
+        # Strategy 4: Try the whole text as-is
         try:
-            return json.loads(text.strip())
+            return json.loads(text)
         except json.JSONDecodeError:
-            logger.warning(f"Failed to parse JSON from response: {text[:200]}...")
-            return {"error": "Failed to parse response", "raw": text[:500]}
+            pass
+
+        logger.warning(f"Failed to parse JSON from response: {text[:200]}...")
+        return {"error": "Failed to parse response", "raw": text[:500]}
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> Optional[dict]:
+        """Find the first valid JSON object in text using brace matching."""
+        start = text.find("{")
+        while start != -1:
+            depth = 0
+            in_string = False
+            escape_next = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\":
+                    if in_string:
+                        escape_next = True
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+            start = text.find("{", start + 1)
+        return None
+
+    @staticmethod
+    def _validate_response_schema(data: dict, persona: str) -> dict:
+        """Validate that parsed JSON has the expected keys for a persona.
+
+        Returns the data if valid, or a safe default that causes rejection.
+        """
+        if "error" in data and "raw" in data:
+            return data
+
+        if persona == "architect":
+            required = {"title", "files_to_modify"}
+            if not required.issubset(data.keys()):
+                logger.warning(f"Architect response missing keys: {required - data.keys()}")
+                return {
+                    "title": data.get("title", "invalid-plan"),
+                    "files_to_modify": data.get("files_to_modify", []),
+                    "improvement_type": data.get("improvement_type", "unknown"),
+                    "rationale": data.get("rationale", "Schema validation failed"),
+                    "_schema_error": True,
+                }
+
+        elif persona == "builder":
+            if "changes" not in data or not isinstance(data.get("changes"), list):
+                logger.warning("Builder response missing 'changes' list")
+                return {
+                    "changes": [],
+                    "test_changes": [],
+                    "_schema_error": True,
+                }
+            for change in data["changes"]:
+                if not isinstance(change, dict):
+                    continue
+                if "file" not in change or "content" not in change:
+                    logger.warning(f"Builder change missing file/content: {change.keys()}")
+                    return {
+                        "changes": [],
+                        "test_changes": [],
+                        "_schema_error": True,
+                    }
+
+        elif persona == "reviewer":
+            valid = True
+            if "approved" not in data or not isinstance(data.get("approved"), bool):
+                valid = False
+            if "score" not in data:
+                valid = False
+            elif not isinstance(data.get("score"), (int, float)):
+                valid = False
+            if "findings" not in data or not isinstance(data.get("findings"), list):
+                valid = False
+            if not valid:
+                logger.warning("Reviewer response has invalid schema")
+                return {
+                    "approved": False,
+                    "score": 0.0,
+                    "findings": [],
+                    "summary": "Schema validation failed — auto-rejecting",
+                    "_schema_error": True,
+                }
+
+        return data

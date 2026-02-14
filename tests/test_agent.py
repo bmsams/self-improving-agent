@@ -16,6 +16,7 @@ from src.core.models import (
     ReviewFinding, ReviewResult, Severity,
 )
 from src.core.providers import MockProvider
+from src.core.loop import ImprovementLoop
 from src.agents.personas import get_persona, PERSONAS, AgentRole
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
@@ -391,3 +392,182 @@ class TestIntegration:
             assert entry.generation == 1
             assert entry.action is not None
             assert len(mock.call_log) >= 3  # Plan + Build + Review at minimum
+
+
+# ─── JSON Parsing Tests ──────────────────────────────────────────
+
+class TestJsonParsing:
+    """Tests for robust JSON response parsing (Task 1)."""
+
+    def test_parse_clean_json(self):
+        """Parse a clean JSON string with no wrapping."""
+        result = ImprovementLoop._parse_json_response('{"key": "value"}')
+        assert result == {"key": "value"}
+
+    def test_parse_json_fenced_with_lang(self):
+        """Parse JSON wrapped in ```json ... ``` fences."""
+        text = 'Here is the plan:\n```json\n{"title": "test"}\n```\nDone!'
+        result = ImprovementLoop._parse_json_response(text)
+        assert result == {"title": "test"}
+
+    def test_parse_json_fenced_without_lang(self):
+        """Parse JSON wrapped in ``` ... ``` fences (no language tag)."""
+        text = 'Result:\n```\n{"title": "test", "score": 1.0}\n```'
+        result = ImprovementLoop._parse_json_response(text)
+        assert result == {"title": "test", "score": 1.0}
+
+    def test_parse_json_with_trailing_text(self):
+        """Parse JSON followed by explanation text."""
+        text = '{"approved": true, "score": 0.9}\n\nThis looks good because...'
+        result = ImprovementLoop._parse_json_response(text)
+        assert result["approved"] is True
+        assert result["score"] == 0.9
+
+    def test_parse_json_with_leading_text(self):
+        """Parse JSON preceded by explanation text."""
+        text = 'Here is my analysis:\n\n{"findings": [], "score": 0.8}'
+        result = ImprovementLoop._parse_json_response(text)
+        assert result["findings"] == []
+        assert result["score"] == 0.8
+
+    def test_parse_multiple_json_blocks(self):
+        """When multiple JSON blocks exist, take the first valid one."""
+        text = (
+            'First block:\n```json\n{"title": "first"}\n```\n\n'
+            'Second block:\n```json\n{"title": "second"}\n```'
+        )
+        result = ImprovementLoop._parse_json_response(text)
+        assert result["title"] == "first"
+
+    def test_parse_completely_missing_json(self):
+        """Return structured error when no JSON found at all."""
+        text = "I don't have any JSON for you, sorry."
+        result = ImprovementLoop._parse_json_response(text)
+        assert "error" in result
+        assert "raw" in result
+
+    def test_parse_nested_json(self):
+        """Parse JSON with nested objects."""
+        data = {"changes": [{"file": "a.py", "content": "x = {'nested': True}"}]}
+        text = f"```json\n{json.dumps(data)}\n```"
+        result = ImprovementLoop._parse_json_response(text)
+        assert result["changes"][0]["file"] == "a.py"
+
+    def test_parse_json_with_newlines_in_strings(self):
+        """Parse JSON containing escaped newlines in string values."""
+        data = {"content": "line1\\nline2\\nline3"}
+        text = json.dumps(data)
+        result = ImprovementLoop._parse_json_response(text)
+        assert "line1" in result["content"]
+
+    def test_parse_json_embedded_in_markdown(self):
+        """Parse JSON embedded in a longer markdown response."""
+        text = (
+            "## Analysis\n\n"
+            "Based on the code review, here are my findings:\n\n"
+            '{"approved": false, "score": 0.3, "findings": ['
+            '{"severity": "high", "description": "Missing tests"}]}\n\n'
+            "### Recommendations\n"
+            "You should add more tests."
+        )
+        result = ImprovementLoop._parse_json_response(text)
+        assert result["approved"] is False
+        assert len(result["findings"]) == 1
+
+    def test_parse_empty_response(self):
+        """Handle empty response gracefully."""
+        result = ImprovementLoop._parse_json_response("")
+        assert "error" in result
+
+    def test_parse_json_array_not_object(self):
+        """Handle response that is a JSON array — wraps it or returns error."""
+        text = '[{"item": 1}, {"item": 2}]'
+        result = ImprovementLoop._parse_json_response(text)
+        # Should return error since we expect dict, or extract first object
+        # The brace matcher finds the first { } which is {"item": 1}
+        assert "item" in result or "error" in result
+
+    def test_extract_first_json_object(self):
+        """Direct test of _extract_first_json_object helper."""
+        text = 'prefix {"a": 1, "b": {"c": 2}} suffix'
+        result = ImprovementLoop._extract_first_json_object(text)
+        assert result == {"a": 1, "b": {"c": 2}}
+
+    def test_extract_first_json_object_none(self):
+        """Returns None when no valid JSON object found."""
+        result = ImprovementLoop._extract_first_json_object("no json here")
+        assert result is None
+
+
+# ─── Schema Validation Tests ─────────────────────────────────────
+
+class TestSchemaValidation:
+    """Tests for _validate_response_schema (Task 1)."""
+
+    def test_validate_architect_valid(self):
+        """Valid architect response passes validation."""
+        data = {"title": "add-tests", "files_to_modify": ["src/a.py"]}
+        result = ImprovementLoop._validate_response_schema(data, "architect")
+        assert result["title"] == "add-tests"
+        assert "_schema_error" not in result
+
+    def test_validate_architect_missing_title(self):
+        """Architect response without title gets safe default."""
+        data = {"files_to_modify": ["src/a.py"]}
+        result = ImprovementLoop._validate_response_schema(data, "architect")
+        assert result["title"] == "invalid-plan"
+        assert result["_schema_error"] is True
+
+    def test_validate_builder_valid(self):
+        """Valid builder response passes validation."""
+        data = {"changes": [{"file": "a.py", "content": "x = 1"}]}
+        result = ImprovementLoop._validate_response_schema(data, "builder")
+        assert len(result["changes"]) == 1
+        assert "_schema_error" not in result
+
+    def test_validate_builder_missing_changes(self):
+        """Builder response without changes list gets safe default."""
+        data = {"description": "did stuff"}
+        result = ImprovementLoop._validate_response_schema(data, "builder")
+        assert result["changes"] == []
+        assert result["_schema_error"] is True
+
+    def test_validate_builder_bad_change_entry(self):
+        """Builder response with bad change entries gets safe default."""
+        data = {"changes": [{"file": "a.py"}]}  # missing 'content'
+        result = ImprovementLoop._validate_response_schema(data, "builder")
+        assert result["changes"] == []
+        assert result["_schema_error"] is True
+
+    def test_validate_reviewer_valid(self):
+        """Valid reviewer response passes validation."""
+        data = {"approved": True, "score": 0.85, "findings": []}
+        result = ImprovementLoop._validate_response_schema(data, "reviewer")
+        assert result["approved"] is True
+        assert "_schema_error" not in result
+
+    def test_validate_reviewer_missing_approved(self):
+        """Reviewer response without approved bool gets safe default."""
+        data = {"score": 0.5, "findings": []}
+        result = ImprovementLoop._validate_response_schema(data, "reviewer")
+        assert result["approved"] is False
+        assert result["_schema_error"] is True
+
+    def test_validate_reviewer_bad_score_type(self):
+        """Reviewer with string score gets safe default."""
+        data = {"approved": True, "score": "high", "findings": []}
+        result = ImprovementLoop._validate_response_schema(data, "reviewer")
+        assert result["approved"] is False
+        assert result["_schema_error"] is True
+
+    def test_validate_unknown_persona_passes_through(self):
+        """Unknown persona names pass data through unchanged."""
+        data = {"anything": "goes"}
+        result = ImprovementLoop._validate_response_schema(data, "unknown")
+        assert result == data
+
+    def test_validate_error_response_passes_through(self):
+        """Error responses from failed parsing pass through."""
+        data = {"error": "Failed to parse", "raw": "garbage"}
+        result = ImprovementLoop._validate_response_schema(data, "architect")
+        assert result == data
