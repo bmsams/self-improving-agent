@@ -1,0 +1,22 @@
+# Agent runtime files
+.agent_state.json
+.benchmark_history.json
+
+# Secrets
+.env
+.env.txt
+sops/.env.txt
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+coverage.json
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
