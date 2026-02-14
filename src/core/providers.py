@@ -1,17 +1,71 @@
 """LLM provider implementations for the self-improving agent.
 
-Supports Anthropic (Claude), OpenAI, and a local mock for testing.
+Supports Anthropic (Claude), AWS Bedrock, and a local mock for testing.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import time
+from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TokenUsage:
+    """Tracks token usage and cost for LLM calls."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_calls: int = 0
+    total_latency_seconds: float = 0.0
+
+    # Pricing per million tokens (Sonnet defaults)
+    input_price_per_mtok: float = 3.0
+    output_price_per_mtok: float = 15.0
+
+    @property
+    def total_cost(self) -> float:
+        """Calculate total cost in USD."""
+        input_cost = self.input_tokens / 1_000_000 * self.input_price_per_mtok
+        output_cost = self.output_tokens / 1_000_000 * self.output_price_per_mtok
+        return input_cost + output_cost
+
+    def record(self, input_tok: int, output_tok: int, latency: float) -> None:
+        """Record a single API call's usage."""
+        self.input_tokens += input_tok
+        self.output_tokens += output_tok
+        self.total_calls += 1
+        self.total_latency_seconds += latency
+
+    def summary(self) -> dict:
+        """Return a summary dict for logging/reporting."""
+        return {
+            "total_calls": self.total_calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_cost_usd": round(self.total_cost, 4),
+            "avg_latency_s": round(
+                self.total_latency_seconds / max(1, self.total_calls), 2
+            ),
+        }
 
 
 class AnthropicProvider:
-    """LLM provider using the Anthropic API (Claude)."""
+    """LLM provider using the Anthropic API (Claude).
+
+    Features:
+    - Exponential backoff retry on rate limit and connection errors
+    - Token counting and cost tracking
+    - Fail-fast on authentication errors
+    """
+
+    RETRY_DELAYS = [1, 4, 16]  # seconds between retries
 
     def __init__(
         self,
@@ -21,6 +75,7 @@ class AnthropicProvider:
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.model = model
         self._client = None
+        self.usage = TokenUsage()
 
     def _get_client(self):
         """Lazy-initialize the Anthropic client."""
@@ -42,16 +97,165 @@ class AnthropicProvider:
         temperature: float = 0.7,
         max_tokens: int = 4096,
     ) -> str:
-        """Send a completion request to Claude."""
+        """Send a completion request to Claude with retry logic."""
+        import anthropic
+
         client = self._get_client()
-        response = await client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-        )
-        return response.content[0].text
+        last_error = None
+
+        for attempt in range(len(self.RETRY_DELAYS) + 1):
+            try:
+                start = time.monotonic()
+                response = await client.messages.create(
+                    model=self.model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_message}],
+                )
+                latency = time.monotonic() - start
+
+                # Track token usage
+                input_tok = getattr(response.usage, "input_tokens", 0)
+                output_tok = getattr(response.usage, "output_tokens", 0)
+                self.usage.record(input_tok, output_tok, latency)
+                logger.debug(
+                    f"LLM call: {input_tok} in / {output_tok} out, "
+                    f"{latency:.1f}s, cost=${self.usage.total_cost:.4f}"
+                )
+
+                return response.content[0].text
+
+            except anthropic.AuthenticationError:
+                raise  # Don't retry auth errors
+
+            except anthropic.RateLimitError as e:
+                last_error = e
+                if attempt < len(self.RETRY_DELAYS):
+                    delay = self.RETRY_DELAYS[attempt]
+                    logger.warning(
+                        f"Rate limited (attempt {attempt + 1}), "
+                        f"retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+
+            except anthropic.APIConnectionError as e:
+                last_error = e
+                if attempt < len(self.RETRY_DELAYS):
+                    delay = self.RETRY_DELAYS[attempt]
+                    logger.warning(
+                        f"Connection error (attempt {attempt + 1}), "
+                        f"retrying in {delay}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+
+        raise last_error  # type: ignore[misc]
+
+
+class BedrockProvider:
+    """LLM provider using AWS Bedrock (Claude models).
+
+    Same interface as AnthropicProvider, uses boto3 bedrock-runtime.
+    """
+
+    RETRY_DELAYS = [1, 4, 16]
+
+    def __init__(
+        self,
+        model_id: str = "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        region: str = "us-east-1",
+    ):
+        self.model_id = model_id
+        self.region = region
+        self._client = None
+        self.usage = TokenUsage()
+
+    def _get_client(self):
+        """Lazy-initialize the Bedrock runtime client."""
+        if self._client is None:
+            try:
+                import boto3
+                self._client = boto3.client(
+                    "bedrock-runtime", region_name=self.region
+                )
+            except ImportError:
+                raise RuntimeError(
+                    "boto3 package not installed. "
+                    "Run: pip install boto3"
+                )
+        return self._client
+
+    async def complete(
+        self,
+        system_prompt: str,
+        user_message: str,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> str:
+        """Send a completion request via Bedrock with retry logic."""
+        client = self._get_client()
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_message}],
+        })
+
+        last_error: Optional[Exception] = None
+
+        for attempt in range(len(self.RETRY_DELAYS) + 1):
+            try:
+                start = time.monotonic()
+                # Run synchronous boto3 call in executor
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: client.invoke_model(
+                        modelId=self.model_id,
+                        body=body,
+                        contentType="application/json",
+                        accept="application/json",
+                    ),
+                )
+                latency = time.monotonic() - start
+
+                result = json.loads(response["body"].read())
+                text = result["content"][0]["text"]
+
+                input_tok = result.get("usage", {}).get("input_tokens", 0)
+                output_tok = result.get("usage", {}).get("output_tokens", 0)
+                self.usage.record(input_tok, output_tok, latency)
+
+                return text
+
+            except Exception as e:
+                error_str = str(e)
+                if "ThrottlingException" in error_str:
+                    last_error = e
+                    if attempt < len(self.RETRY_DELAYS):
+                        delay = self.RETRY_DELAYS[attempt]
+                        logger.warning(
+                            f"Bedrock throttled (attempt {attempt + 1}), "
+                            f"retrying in {delay}s..."
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                elif "ExpiredTokenException" in error_str:
+                    raise  # Don't retry auth errors
+                else:
+                    last_error = e
+                    if attempt < len(self.RETRY_DELAYS):
+                        delay = self.RETRY_DELAYS[attempt]
+                        logger.warning(
+                            f"Bedrock error (attempt {attempt + 1}), "
+                            f"retrying in {delay}s: {e}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+
+        raise last_error  # type: ignore[misc]
 
 
 class MockProvider:
@@ -63,6 +267,7 @@ class MockProvider:
     def __init__(self, responses: Optional[dict[str, str]] = None):
         self.responses = responses or {}
         self.call_log: list[dict] = []
+        self.usage = TokenUsage()
 
     async def complete(
         self,

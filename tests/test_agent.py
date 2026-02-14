@@ -16,7 +16,7 @@ from src.core.models import (
     BenchmarkSuite, EvolutionEntry, PRStatus, PullRequest,
     ReviewFinding, ReviewResult, Severity,
 )
-from src.core.providers import MockProvider
+from src.core.providers import MockProvider, TokenUsage, AnthropicProvider, BedrockProvider
 from src.core.loop import ImprovementLoop
 from src.agents.personas import get_persona, PERSONAS, AgentRole
 from src.benchmarks.runner import BenchmarkRunner
@@ -741,3 +741,96 @@ class TestErrorRecovery:
             assert len(suite.results) == 1
             assert suite.results[0].passed is False
             assert "Timed out" in suite.results[0].details.get("error", "")
+
+
+# ─── Provider Tests (Task 3) ─────────────────────────────────────
+
+class TestTokenUsage:
+    """Tests for token tracking and cost calculation."""
+
+    def test_cost_calculation(self):
+        """Verify cost calculation with known values."""
+        usage = TokenUsage()
+        usage.record(1_000_000, 100_000, 5.0)
+        # 1M input * $3/MTok = $3.00, 100K output * $15/MTok = $1.50
+        assert abs(usage.total_cost - 4.50) < 0.01
+
+    def test_multiple_records(self):
+        """Track multiple calls."""
+        usage = TokenUsage()
+        usage.record(500, 100, 1.0)
+        usage.record(500, 100, 2.0)
+        assert usage.total_calls == 2
+        assert usage.input_tokens == 1000
+        assert usage.output_tokens == 200
+        assert usage.total_latency_seconds == 3.0
+
+    def test_summary(self):
+        """Summary dict has expected keys."""
+        usage = TokenUsage()
+        usage.record(100, 50, 1.0)
+        summary = usage.summary()
+        assert "total_calls" in summary
+        assert "total_cost_usd" in summary
+        assert summary["total_calls"] == 1
+
+    def test_mock_provider_has_usage(self):
+        """MockProvider should have a usage tracker."""
+        mock = MockProvider()
+        assert hasattr(mock, "usage")
+        assert isinstance(mock.usage, TokenUsage)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_retry_on_rate_limit(self):
+        """AnthropicProvider retries on rate limit errors."""
+        import anthropic
+
+        provider = AnthropicProvider(api_key="test-key")
+        provider.RETRY_DELAYS = [0, 0, 0]  # No actual delays in test
+
+        call_count = 0
+
+        async def mock_create(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise anthropic.RateLimitError(
+                    message="rate limited",
+                    response=MagicMock(status_code=429),
+                    body={"error": {"message": "rate limited"}},
+                )
+
+            mock_resp = MagicMock()
+            mock_resp.content = [MagicMock(text='{"result": "ok"}')]
+            mock_resp.usage = MagicMock(input_tokens=100, output_tokens=50)
+            return mock_resp
+
+        mock_client = MagicMock()
+        mock_client.messages.create = mock_create
+        provider._client = mock_client
+
+        result = await provider.complete("system", "user")
+        assert call_count == 3
+        assert "ok" in result
+
+    @pytest.mark.asyncio
+    async def test_anthropic_no_retry_on_auth_error(self):
+        """AnthropicProvider fails fast on auth errors."""
+        import anthropic
+
+        provider = AnthropicProvider(api_key="bad-key")
+        provider.RETRY_DELAYS = [0, 0, 0]
+
+        async def mock_create(**kwargs):
+            raise anthropic.AuthenticationError(
+                message="invalid key",
+                response=MagicMock(status_code=401),
+                body={"error": {"message": "invalid key"}},
+            )
+
+        mock_client = MagicMock()
+        mock_client.messages.create = mock_create
+        provider._client = mock_client
+
+        with pytest.raises(anthropic.AuthenticationError):
+            await provider.complete("system", "user")

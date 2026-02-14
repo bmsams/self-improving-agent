@@ -27,7 +27,7 @@ from pathlib import Path
 
 from src.core.models import AgentConfig, AgentState
 from src.core.loop import ImprovementLoop
-from src.core.providers import AnthropicProvider, MockProvider
+from src.core.providers import AnthropicProvider, BedrockProvider, MockProvider
 from src.core.agentcore import AgentCoreConfig, AgentCoreServices
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
@@ -52,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     # run — single generation
     run_p = sub.add_parser("run", help="Run one improvement generation")
     run_p.add_argument("--mock", action="store_true", help="Use mock LLM provider")
+    run_p.add_argument("--provider", choices=["anthropic", "bedrock", "mock"], default="anthropic",
+                       help="LLM provider to use")
+    run_p.add_argument("--model", type=str, default=None, help="Override default model name")
     run_p.add_argument("--auto-merge", action="store_true", help="Auto-merge without review gate")
     run_p.add_argument("--agentcore", action="store_true", help="Enable AWS Bedrock AgentCore services")
     run_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
@@ -61,6 +64,9 @@ def parse_args() -> argparse.Namespace:
     loop_p = sub.add_parser("loop", help="Run continuous improvement loop")
     loop_p.add_argument("--max-gen", type=int, default=10, help="Maximum generations")
     loop_p.add_argument("--mock", action="store_true", help="Use mock LLM provider")
+    loop_p.add_argument("--provider", choices=["anthropic", "bedrock", "mock"], default="anthropic",
+                        help="LLM provider to use")
+    loop_p.add_argument("--model", type=str, default=None, help="Override default model name")
     loop_p.add_argument("--auto-merge", action="store_true", help="Auto-merge without review gate")
     loop_p.add_argument("--agentcore", action="store_true", help="Enable AWS Bedrock AgentCore services")
     loop_p.add_argument("--agentcore-region", default="us-east-1", help="AgentCore AWS region")
@@ -85,6 +91,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _make_provider(args: argparse.Namespace):
+    """Create the LLM provider based on CLI args."""
+    # --mock flag takes precedence for backward compatibility
+    if getattr(args, "mock", False):
+        return MockProvider()
+
+    provider = getattr(args, "provider", "anthropic")
+    model = getattr(args, "model", None)
+
+    if provider == "mock":
+        return MockProvider()
+    elif provider == "bedrock":
+        kwargs = {}
+        if model:
+            kwargs["model_id"] = model
+        return BedrockProvider(**kwargs)
+    else:
+        kwargs = {}
+        if model:
+            kwargs["model"] = model
+        return AnthropicProvider(**kwargs)
+
+
 def _make_agentcore_config(args: argparse.Namespace) -> AgentCoreConfig:
     """Build AgentCore config from CLI args."""
     if getattr(args, "agentcore", False):
@@ -101,7 +130,7 @@ async def cmd_run(args: argparse.Namespace, root: Path) -> None:
         project_root=root,
         auto_merge=getattr(args, "auto_merge", False),
     )
-    llm = MockProvider() if args.mock else AnthropicProvider()
+    llm = _make_provider(args)
     ac_config = _make_agentcore_config(args)
     dry_run = getattr(args, "dry_run", False)
     loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config, dry_run=dry_run)
@@ -126,7 +155,7 @@ async def cmd_loop(args: argparse.Namespace, root: Path) -> None:
         max_generations=args.max_gen,
         auto_merge=getattr(args, "auto_merge", False),
     )
-    llm = MockProvider() if args.mock else AnthropicProvider()
+    llm = _make_provider(args)
     ac_config = _make_agentcore_config(args)
     dry_run = getattr(args, "dry_run", False)
     loop = ImprovementLoop(config, llm, root, agentcore_config=ac_config, dry_run=dry_run)
