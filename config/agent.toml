@@ -1,0 +1,43 @@
+[agent]
+model = "claude-sonnet-4-5-20250929"
+provider = "anthropic"
+max_generations = 100
+auto_merge = false
+benchmark_threshold = 0.0
+review_consensus = 0.6
+log_level = "INFO"
+
+[benchmarks]
+enabled = [
+    "test_pass_rate",
+    "code_complexity",
+    "type_check",
+    "code_coverage",
+    "lint_score",
+    "doc_coverage",
+    "file_organization",
+    "import_check",
+    "security_scan",
+]
+timeout_seconds = 60
+
+[benchmarks.weights]
+test_pass_rate = 2.0
+code_complexity = 1.0
+type_check = 1.0
+code_coverage = 1.0
+lint_score = 0.5
+doc_coverage = 0.5
+file_organization = 0.5
+import_check = 1.0
+security_scan = 1.5
+
+[agentcore]
+enabled = false
+region = "us-east-1"
+memory_namespace = "self-improving-agent"
+
+[safety]
+max_files_per_generation = 10
+blocked_patterns = ["os.system", "subprocess.call", "eval(", "exec("]
+require_tests = true

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -21,6 +22,9 @@ from src.core.loop import ImprovementLoop
 from src.core.reporting import (
     GenerationReport, PhaseTimestamp, LLMCallRecord,
     load_report, load_all_reports, format_report, format_dashboard,
+)
+from src.core.config import (
+    AgentSettings, load_config, validate_config, format_config,
 )
 from src.agents.personas import get_persona, PERSONAS, AgentRole
 from src.benchmarks.runner import BenchmarkRunner
@@ -1079,3 +1083,103 @@ class TestGenerationReport:
         """Dashboard handles empty report list gracefully."""
         output = format_dashboard([])
         assert "No generation reports" in output
+
+
+# ─── Configuration Tests (Task 7) ────────────────────────────────
+
+class TestConfiguration:
+    """Tests for configuration loading, merging, and validation."""
+
+    def test_default_settings(self):
+        """Default settings have reasonable values."""
+        settings = AgentSettings()
+        assert settings.model == "claude-sonnet-4-5-20250929"
+        assert settings.provider == "anthropic"
+        assert settings.max_generations == 100
+        assert settings.auto_merge is False
+        assert len(settings.benchmarks_enabled) >= 7
+
+    def test_load_config_from_toml(self):
+        """Load config from a TOML file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_dir = root / "config"
+            config_dir.mkdir()
+            (config_dir / "agent.toml").write_text(
+                '[agent]\n'
+                'model = "claude-opus-4-6"\n'
+                'max_generations = 50\n'
+                'auto_merge = true\n'
+                '\n'
+                '[benchmarks]\n'
+                'timeout_seconds = 90\n'
+            )
+            settings = load_config(root)
+            assert settings.model == "claude-opus-4-6"
+            assert settings.max_generations == 50
+            assert settings.auto_merge is True
+            assert settings.benchmarks_timeout == 90
+
+    def test_load_config_no_file(self):
+        """Load defaults when no config file exists."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = load_config(Path(tmpdir))
+            assert settings.model == "claude-sonnet-4-5-20250929"
+
+    def test_cli_overrides(self):
+        """CLI args override file config."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_dir = root / "config"
+            config_dir.mkdir()
+            (config_dir / "agent.toml").write_text(
+                '[agent]\nmodel = "claude-opus-4-6"\nprovider = "anthropic"\n'
+            )
+            settings = load_config(root, cli_overrides={
+                "model": "claude-haiku-3-5",
+                "provider": "mock",
+            })
+            assert settings.model == "claude-haiku-3-5"
+            assert settings.provider == "mock"
+
+    def test_env_overrides(self):
+        """Environment variables override everything."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original = os.environ.get("AGENT_MODEL")
+            try:
+                os.environ["AGENT_MODEL"] = "env-model"
+                settings = load_config(root)
+                assert settings.model == "env-model"
+            finally:
+                if original is None:
+                    os.environ.pop("AGENT_MODEL", None)
+                else:
+                    os.environ["AGENT_MODEL"] = original
+
+    def test_validate_valid_config(self):
+        """Valid config produces no issues."""
+        settings = AgentSettings()
+        issues = validate_config(settings)
+        assert issues == []
+
+    def test_validate_invalid_provider(self):
+        """Invalid provider is flagged."""
+        settings = AgentSettings(provider="invalid")
+        issues = validate_config(settings)
+        assert any("provider" in i for i in issues)
+
+    def test_validate_invalid_max_gen(self):
+        """max_generations < 1 is flagged."""
+        settings = AgentSettings(max_generations=0)
+        issues = validate_config(settings)
+        assert any("max_generations" in i for i in issues)
+
+    def test_format_config_output(self):
+        """format_config produces readable output."""
+        settings = AgentSettings()
+        output = format_config(settings)
+        assert "[agent]" in output
+        assert "anthropic" in output
+        assert "[benchmarks]" in output
+        assert "[safety]" in output

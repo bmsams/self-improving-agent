@@ -32,6 +32,7 @@ from src.core.loop import ImprovementLoop
 from src.core.providers import AnthropicProvider, BedrockProvider, MockProvider
 from src.core.agentcore import AgentCoreConfig, AgentCoreServices
 from src.core.reporting import load_report, load_all_reports, format_report, format_dashboard
+from src.core.config import load_config, validate_config, format_config
 from src.benchmarks.runner import BenchmarkRunner
 from src.git_ops.git_manager import GitOps
 
@@ -94,6 +95,12 @@ def parse_args() -> argparse.Namespace:
 
     # dashboard — show aggregate dashboard
     sub.add_parser("dashboard", help="Show aggregate dashboard across all generations")
+
+    # config — validate or show config
+    config_p = sub.add_parser("config", help="Configuration commands")
+    config_sub = config_p.add_subparsers(dest="config_cmd", help="Config subcommand")
+    config_sub.add_parser("validate", help="Validate config/agent.toml")
+    config_sub.add_parser("show", help="Show effective configuration")
 
     # reset — reset state
     sub.add_parser("reset", help="Reset agent state to generation 0")
@@ -245,6 +252,24 @@ def cmd_dashboard(root: Path) -> None:
     print(format_dashboard(reports))
 
 
+def cmd_config_validate(root: Path) -> None:
+    """Validate the config file."""
+    settings = load_config(root)
+    issues = validate_config(settings)
+    if issues:
+        print("Configuration issues found:")
+        for issue in issues:
+            print(f"  - {issue}")
+    else:
+        print("Configuration is valid.")
+
+
+def cmd_config_show(root: Path) -> None:
+    """Show effective configuration."""
+    settings = load_config(root)
+    print(format_config(settings))
+
+
 def cmd_agentcore_status() -> None:
     """Display AWS Bedrock AgentCore service health."""
     ac_config = AgentCoreConfig.from_env()
@@ -302,6 +327,13 @@ def main() -> None:
         cmd_report(root, args.gen)
     elif args.command == "dashboard":
         cmd_dashboard(root)
+    elif args.command == "config":
+        if getattr(args, "config_cmd", None) == "validate":
+            cmd_config_validate(root)
+        elif getattr(args, "config_cmd", None) == "show":
+            cmd_config_show(root)
+        else:
+            print("Usage: python main.py config {validate|show}")
     elif args.command == "reset":
         cmd_reset(root)
 
