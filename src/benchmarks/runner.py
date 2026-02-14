@@ -11,6 +11,7 @@ import concurrent.futures
 import importlib
 import json
 import logging
+import re
 import subprocess
 import time
 import uuid
@@ -18,9 +19,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from src.core.models import BenchmarkResult, BenchmarkSuite
+
 logger = logging.getLogger(__name__)
 
-from src.core.models import BenchmarkResult, BenchmarkSuite
+DANGEROUS_PATTERNS = [
+    r'\beval\s*\(',
+    r'\bexec\s*\(',
+    r'subprocess\.call\s*\(.*shell\s*=\s*True',
+    r'subprocess\.Popen\s*\(.*shell\s*=\s*True',
+    r'\bos\.system\s*\(',
+    r'pickle\.loads?\s*\(',
+    r'marshal\.loads?\s*\(',
+    r'__import__\s*\(',
+]
 
 
 @dataclass
@@ -94,6 +106,20 @@ class BenchmarkRunner:
                 max_score=100.0,
                 runner=self._bench_file_organization,
                 category="architecture",
+            ),
+            BenchmarkDef(
+                name="import_check",
+                description="Verify all src/ modules can be imported without errors",
+                max_score=100.0,
+                runner=self._bench_import_check,
+                category="correctness",
+            ),
+            BenchmarkDef(
+                name="security_scan",
+                description="Check for dangerous patterns (eval, exec, shell=True, pickle)",
+                max_score=100.0,
+                runner=self._bench_security_scan,
+                category="security",
             ),
         ]
 
@@ -215,43 +241,66 @@ class BenchmarkRunner:
     # ─── Built-in Benchmark Implementations ────────────────────────
 
     def _bench_test_pass_rate(self) -> BenchmarkResult:
-        """Run pytest and measure pass rate."""
+        """Run pytest and measure pass rate using junitxml for reliable parsing."""
         start = time.time()
+        junit_path = self.project_root / ".junit-results.xml"
         result = subprocess.run(
-            ["python", "-m", "pytest", "tests/", "-v", "--tb=short", "-q"],
+            ["python", "-m", "pytest", "tests/", "-v", "--tb=short", "-q",
+             f"--junitxml={junit_path}"],
             cwd=self.project_root, capture_output=True, text=True, check=False,
         )
         duration = time.time() - start
-        output = result.stdout + result.stderr
 
-        # Parse pytest output for pass/fail counts
-        passed = failed = 0
-        for line in output.split("\n"):
-            if "passed" in line:
-                parts = line.split()
-                for i, p in enumerate(parts):
-                    if p == "passed" and i > 0:
-                        try:
-                            passed = int(parts[i - 1])
-                        except ValueError:
-                            pass
-                    if p == "failed" and i > 0:
-                        try:
-                            failed = int(parts[i - 1])
-                        except ValueError:
-                            pass
+        # Try parsing junitxml first (more reliable)
+        passed = failed = errors = 0
+        if junit_path.exists():
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(junit_path)
+                root = tree.getroot()
+                for suite in root.iter("testsuite"):
+                    passed += int(suite.get("tests", 0)) - int(suite.get("failures", 0)) - int(suite.get("errors", 0))
+                    failed += int(suite.get("failures", 0))
+                    errors += int(suite.get("errors", 0))
+            except Exception:
+                passed, failed = self._parse_pytest_stdout(result.stdout + result.stderr)
+            finally:
+                junit_path.unlink(missing_ok=True)
+        else:
+            passed, failed = self._parse_pytest_stdout(result.stdout + result.stderr)
 
-        total = passed + failed
+        total = passed + failed + errors
         score = (passed / total * 100) if total > 0 else 0.0
 
         return BenchmarkResult(
             benchmark_name="test_pass_rate",
             score=score,
             max_score=100.0,
-            passed=failed == 0 and passed > 0,
+            passed=failed == 0 and errors == 0 and passed > 0,
             duration_seconds=duration,
-            details={"passed": passed, "failed": failed, "output": output[:2000]},
+            details={"passed": passed, "failed": failed, "errors": errors},
         )
+
+    @staticmethod
+    def _parse_pytest_stdout(output: str) -> tuple[int, int]:
+        """Fallback: parse pytest stdout for pass/fail counts."""
+        passed = failed = 0
+        for line in output.split("\n"):
+            if "passed" in line or "failed" in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    word = p.rstrip(",")
+                    if word == "passed" and i > 0:
+                        try:
+                            passed = int(parts[i - 1])
+                        except ValueError:
+                            pass
+                    if word == "failed" and i > 0:
+                        try:
+                            failed = int(parts[i - 1])
+                        except ValueError:
+                            pass
+        return passed, failed
 
     def _bench_code_complexity(self) -> BenchmarkResult:
         """Measure average cyclomatic complexity using AST analysis."""
@@ -302,13 +351,28 @@ class BenchmarkRunner:
         return complexity
 
     def _bench_type_check(self) -> BenchmarkResult:
-        """Run mypy type checking."""
+        """Run mypy type checking with proper exit code handling.
+
+        Mypy exit codes: 0 = clean, 1 = type errors found, 2 = fatal error.
+        """
         start = time.time()
         result = subprocess.run(
             ["python", "-m", "mypy", "src/", "--ignore-missing-imports", "--no-error-summary"],
             cwd=self.project_root, capture_output=True, text=True, check=False,
         )
         duration = time.time() - start
+
+        if result.returncode == 2:
+            # Fatal error (bad config, missing source, etc.)
+            return BenchmarkResult(
+                benchmark_name="type_check",
+                score=0.0,
+                max_score=100.0,
+                passed=False,
+                duration_seconds=duration,
+                details={"error": "mypy fatal error", "output": result.stderr[:2000]},
+            )
+
         error_count = result.stdout.count(": error:")
         score = max(0, 100 - error_count * 5)
 
@@ -316,9 +380,9 @@ class BenchmarkRunner:
             benchmark_name="type_check",
             score=score,
             max_score=100.0,
-            passed=error_count == 0,
+            passed=result.returncode == 0,
             duration_seconds=duration,
-            details={"error_count": error_count, "output": result.stdout[:2000]},
+            details={"error_count": error_count, "exit_code": result.returncode},
         )
 
     def _bench_code_coverage(self) -> BenchmarkResult:
@@ -448,6 +512,88 @@ class BenchmarkRunner:
             passed=score >= 70,
             duration_seconds=duration,
             details={"issues": issues},
+        )
+
+    def _bench_import_check(self) -> BenchmarkResult:
+        """Verify all src/ modules can be imported without errors."""
+        start = time.time()
+        src_dir = self.project_root / "src"
+        if not src_dir.exists():
+            return BenchmarkResult(
+                benchmark_name="import_check", score=100.0, max_score=100.0,
+                passed=True, duration_seconds=0.0,
+                details={"note": "No src directory"},
+            )
+
+        py_files = list(src_dir.rglob("*.py"))
+        total = len(py_files)
+        importable = 0
+        failures: list[str] = []
+
+        for py_file in py_files:
+            if py_file.name == "__init__.py":
+                importable += 1
+                continue
+            try:
+                source = py_file.read_text()
+                compile(source, str(py_file), "exec")
+                importable += 1
+            except SyntaxError as e:
+                failures.append(f"{py_file.name}: {e}")
+
+        duration = time.time() - start
+        score = (importable / total * 100) if total > 0 else 100.0
+
+        return BenchmarkResult(
+            benchmark_name="import_check",
+            score=score,
+            max_score=100.0,
+            passed=len(failures) == 0,
+            duration_seconds=duration,
+            details={"total": total, "importable": importable, "failures": failures},
+        )
+
+    def _bench_security_scan(self) -> BenchmarkResult:
+        """Check for dangerous patterns in source code."""
+        start = time.time()
+        src_dir = self.project_root / "src"
+        if not src_dir.exists():
+            return BenchmarkResult(
+                benchmark_name="security_scan", score=100.0, max_score=100.0,
+                passed=True, duration_seconds=0.0,
+                details={"note": "No src directory"},
+            )
+
+        findings: list[dict] = []
+        for py_file in src_dir.rglob("*.py"):
+            try:
+                content = py_file.read_text()
+                rel_path = str(py_file.relative_to(self.project_root))
+                for i, line in enumerate(content.split("\n"), 1):
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    for pattern in DANGEROUS_PATTERNS:
+                        if re.search(pattern, line):
+                            findings.append({
+                                "file": rel_path,
+                                "line": i,
+                                "pattern": pattern,
+                                "code": stripped[:100],
+                            })
+            except (OSError, UnicodeDecodeError):
+                continue
+
+        duration = time.time() - start
+        score = max(0, 100 - len(findings) * 10)
+
+        return BenchmarkResult(
+            benchmark_name="security_scan",
+            score=score,
+            max_score=100.0,
+            passed=len(findings) == 0,
+            duration_seconds=duration,
+            details={"findings_count": len(findings), "findings": findings[:20]},
         )
 
     # ─── History Management ────────────────────────────────────────

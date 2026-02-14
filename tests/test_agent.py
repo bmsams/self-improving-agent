@@ -311,6 +311,112 @@ class TestBenchmarks:
             result = runner._bench_code_complexity()
             assert result.score > 80  # Simple function = low complexity = high score
 
+    def test_import_check_benchmark(self):
+        """Import check benchmark should compile all .py files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "src"
+            src.mkdir()
+            (src / "__init__.py").write_text("")
+            (src / "valid.py").write_text("x = 1\ndef foo(): return x\n")
+            runner = BenchmarkRunner(root)
+            result = runner._bench_import_check()
+            assert result.benchmark_name == "import_check"
+            assert result.score == 100.0
+            assert result.passed is True
+            assert result.details["importable"] == 2
+
+    def test_import_check_with_syntax_error(self):
+        """Import check should catch syntax errors and reduce score."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "src"
+            src.mkdir()
+            (src / "__init__.py").write_text("")
+            (src / "good.py").write_text("x = 1\n")
+            (src / "bad.py").write_text("def broken(\n")  # syntax error
+            runner = BenchmarkRunner(root)
+            result = runner._bench_import_check()
+            assert result.benchmark_name == "import_check"
+            assert result.score < 100.0
+            assert result.passed is False
+            assert len(result.details["failures"]) == 1
+
+    def test_import_check_no_src_dir(self):
+        """Import check should pass gracefully when no src/ directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = BenchmarkRunner(root)
+            result = runner._bench_import_check()
+            assert result.score == 100.0
+            assert result.passed is True
+
+    def test_security_scan_clean(self):
+        """Security scan should pass for clean code."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "src"
+            src.mkdir()
+            (src / "safe.py").write_text("def add(a, b):\n    return a + b\n")
+            runner = BenchmarkRunner(root)
+            result = runner._bench_security_scan()
+            assert result.benchmark_name == "security_scan"
+            assert result.score == 100.0
+            assert result.passed is True
+
+    def test_security_scan_finds_eval(self):
+        """Security scan should detect eval() usage."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "src"
+            src.mkdir()
+            (src / "dangerous.py").write_text(
+                "def run_code(code):\n    return eval(code)\n"
+            )
+            runner = BenchmarkRunner(root)
+            result = runner._bench_security_scan()
+            assert result.score < 100.0
+            assert result.passed is False
+            assert result.details["findings_count"] >= 1
+
+    def test_security_scan_ignores_comments(self):
+        """Security scan should not flag eval() in comments."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "src"
+            src.mkdir()
+            (src / "commented.py").write_text(
+                "# Don't use eval() in production\n"
+                "x = 1\n"
+            )
+            runner = BenchmarkRunner(root)
+            result = runner._bench_security_scan()
+            assert result.score == 100.0
+            assert result.passed is True
+
+    def test_security_scan_no_src_dir(self):
+        """Security scan should pass when no src/ directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = BenchmarkRunner(root)
+            result = runner._bench_security_scan()
+            assert result.score == 100.0
+            assert result.passed is True
+
+    def test_parse_pytest_stdout(self):
+        """Test fallback pytest stdout parser."""
+        output = "====== 5 passed, 2 failed in 1.23s ======\n"
+        passed, failed = BenchmarkRunner._parse_pytest_stdout(output)
+        assert passed == 5
+        assert failed == 2
+
+    def test_parse_pytest_stdout_only_passed(self):
+        """Test fallback parser with only passed tests."""
+        output = "====== 10 passed in 0.5s ======\n"
+        passed, failed = BenchmarkRunner._parse_pytest_stdout(output)
+        assert passed == 10
+        assert failed == 0
+
     def test_suite_comparison(self):
         """Compare two benchmark suites and detect deltas."""
         runner = BenchmarkRunner(Path("."))
