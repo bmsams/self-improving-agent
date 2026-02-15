@@ -1,47 +1,51 @@
-FROM python:3.12-slim
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set up working directory
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 WORKDIR /app
 
-# Copy project files
-COPY pyproject.toml .
-COPY src/ src/
-COPY tests/ tests/
-COPY config/ config/
-COPY main.py .
-COPY runtime_entrypoint.py .
-COPY CLAUDE.md .
-COPY README.md .
-COPY Makefile .
+# Configure UV for container environment
+ENV UV_SYSTEM_PYTHON=1 UV_COMPILE_BYTECODE=1
 
-# Install the package with AgentCore dependencies
-RUN pip install --no-cache-dir -e ".[dev,agentcore]" && \
-    pip install --no-cache-dir aws-opentelemetry-distro==0.10.1
+# System deps (git is required by the self-improving agent).
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends git curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Configure git for the agent
-RUN git config --global user.name "Self-Improving Agent" && \
-    git config --global user.email "agent@self-improving.ai" && \
-    git config --global init.defaultBranch main
+COPY requirements.txt requirements.txt
+# Install from requirements file
+RUN uv pip install -r requirements.txt
 
-# Initialize git repo (needed for agent operations)
-RUN git init && git add -A && git commit -m "Initial commit in container"
 
-# Create non-root user for AgentCore Runtime
+
+
+RUN uv pip install aws-opentelemetry-distro>=0.10.1
+
+
+# Set AWS region environment variable
+
+ENV AWS_REGION=us-east-1
+ENV AWS_DEFAULT_REGION=us-east-1
+
+
+# Signal that this is running in Docker for host binding logic
+ENV DOCKER_CONTAINER=1
+
+# Create non-root user
 RUN useradd -m -u 1000 bedrock_agentcore
+
+EXPOSE 8080
+EXPOSE 8000
+
+# Copy entire project (respecting .dockerignore)
+COPY . .
+
+# Ensure the agent user can modify the working tree.
+RUN chown -R bedrock_agentcore:bedrock_agentcore /app
+
 USER bedrock_agentcore
 
-# AgentCore Runtime listens on port 8080
-EXPOSE 8080
+# Initialize a git repo inside the container (the build context excludes `.git/`).
+RUN git config --global user.name "Self-Improving Agent" && \
+    git config --global user.email "agent@self-improving.ai" && \
+    git config --global init.defaultBranch main && \
+    git init && git add -A && git commit -m "Initial commit in container"
 
-# Health check for AgentCore Runtime
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8080/ping || exit 1
-
-# Default: run via AgentCore Runtime with OpenTelemetry instrumentation
-# Override with CMD ["--help"] for CLI mode
-ENTRYPOINT ["opentelemetry-instrument", "python", "-m", "runtime_entrypoint"]
+CMD ["opentelemetry-instrument", "python", "-m", "runtime_entrypoint"]
