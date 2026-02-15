@@ -60,6 +60,11 @@ class AgentSettings:
     agentcore_region: str = "us-east-1"
     agentcore_memory_namespace: str = "self-improving-agent"
 
+    # Per-generation guardrails
+    max_tokens_per_generation: int = 500_000  # Token budget (input + output)
+    generation_timeout_seconds: int = 600     # Wall-clock timeout per generation
+    max_concurrent_subagents: int = 5         # Max parallel sub-agents
+
     # Safety
     safety_max_files: int = 10
     safety_blocked_patterns: list[str] = field(default_factory=lambda: [
@@ -151,6 +156,14 @@ def _apply_toml(settings: AgentSettings, path: Path) -> None:
     if "require_tests" in safety:
         settings.safety_require_tests = bool(safety["require_tests"])
 
+    limits = data.get("limits", {})
+    if "max_tokens_per_generation" in limits:
+        settings.max_tokens_per_generation = int(limits["max_tokens_per_generation"])
+    if "generation_timeout_seconds" in limits:
+        settings.generation_timeout_seconds = int(limits["generation_timeout_seconds"])
+    if "max_concurrent_subagents" in limits:
+        settings.max_concurrent_subagents = int(limits["max_concurrent_subagents"])
+
 
 def _apply_cli(settings: AgentSettings, overrides: dict) -> None:
     """Apply CLI argument overrides."""
@@ -178,6 +191,8 @@ def _apply_env(settings: AgentSettings) -> None:
         "AGENT_LOG_LEVEL": "log_level",
         "AGENTCORE_ENABLED": "agentcore_enabled",
         "AGENTCORE_REGION": "agentcore_region",
+        "AGENT_MAX_TOKENS_PER_GEN": "max_tokens_per_generation",
+        "AGENT_GEN_TIMEOUT": "generation_timeout_seconds",
     }
     for env_key, attr in env_map.items():
         val = os.environ.get(env_key)
@@ -215,6 +230,10 @@ def validate_config(settings: AgentSettings) -> list[str]:
         issues.append(f"Invalid log_level: {settings.log_level}")
     if settings.safety_max_files < 1:
         issues.append(f"safety_max_files must be >= 1, got {settings.safety_max_files}")
+    if settings.max_tokens_per_generation < 1000:
+        issues.append(f"max_tokens_per_generation must be >= 1000, got {settings.max_tokens_per_generation}")
+    if settings.generation_timeout_seconds < 10:
+        issues.append(f"generation_timeout_seconds must be >= 10, got {settings.generation_timeout_seconds}")
     return issues
 
 
@@ -245,6 +264,10 @@ def format_config(settings: AgentSettings) -> str:
         f"  enabled           = {settings.agentcore_enabled}",
         f"  region            = {settings.agentcore_region}",
         f"  memory_namespace  = {settings.agentcore_memory_namespace}",
+        "",
+        "[limits]",
+        f"  max_tokens_per_generation   = {settings.max_tokens_per_generation}",
+        f"  generation_timeout_seconds  = {settings.generation_timeout_seconds}",
         "",
         "[safety]",
         f"  max_files         = {settings.safety_max_files}",

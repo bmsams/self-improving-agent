@@ -12,6 +12,7 @@ This is the heart of the self-improving agent. It orchestrates:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -30,6 +31,9 @@ from src.git_ops.git_manager import GitOps
 from src.core.agentcore import AgentCoreServices, AgentCoreConfig
 from src.core.reporting import GenerationReport
 from src.core.safety import SafetyValidator
+from src.agents.orchestrator import (
+    SubAgentOrchestrator, SubAgentTask, SubAgentResult, MergeStrategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +86,17 @@ class ImprovementLoop:
         # Initialize AgentCore services (gracefully degrades if unavailable)
         self.ac = AgentCoreServices(agentcore_config)
 
+        # Per-generation token budget tracking (reset each generation)
+        self._gen_tokens_used: int = 0
+        self._gen_token_budget: int = config.max_tokens_per_generation
+
+        # Sub-agent orchestrator for parallel task execution
+        self.orchestrator = SubAgentOrchestrator(
+            llm=llm,
+            max_concurrent=config.max_concurrent_subagents,
+            default_timeout=config.generation_timeout_seconds / 2,
+        )
+
     async def run_generation(self) -> EvolutionEntry:
         """Execute one complete improvement generation.
 
@@ -91,8 +106,31 @@ class ImprovementLoop:
         - Records a failed EvolutionEntry
         - Increments generation counter
         - Returns the failed entry (does not raise)
+
+        Enforces per-generation timeout and token budget.
         """
         gen = self.state.generation + 1
+
+        # Reset per-generation token budget
+        self._gen_tokens_used = 0
+
+        # Wrap entire generation in a timeout
+        timeout = self.config.generation_timeout_seconds
+        try:
+            return await asyncio.wait_for(
+                self._run_generation_inner(gen), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Generation {gen} timed out after {timeout}s")
+            self._cleanup_on_failure()
+            return self._record_failure(
+                gen, "timeout",
+                f"Generation exceeded {timeout}s wall-clock limit",
+                self.ac.observability.start_generation_span(gen),
+            )
+
+    async def _run_generation_inner(self, gen: int) -> EvolutionEntry:
+        """Inner generation logic, called within timeout wrapper."""
         branch = None
         logger.info(f"═══ Generation {gen} starting ═══")
 
@@ -391,7 +429,7 @@ class ImprovementLoop:
             await self.ac.memory.store_review_pattern(
                 finding_category=finding.category,
                 finding_severity=finding.severity.value,
-                was_valid=not accepted,
+                was_valid=accepted,
                 description=finding.description,
             )
 
@@ -461,11 +499,18 @@ class ImprovementLoop:
         return entry
 
     async def run_loop(self, max_generations: Optional[int] = None) -> None:
-        """Run the improvement loop continuously with error recovery."""
+        """Run the improvement loop continuously with error recovery.
+
+        Each generation runs with a fresh token budget and no leaked
+        conversation state from previous iterations.
+        """
         max_gen = max_generations or self.config.max_generations
         consecutive_failures = 0
         while self.state.generation < max_gen:
             try:
+                # Context reset: reload state from disk to avoid stale in-memory drift
+                self.state = AgentState.load(self.root / self.config.state_file)
+
                 entry = await self.run_generation()
                 logger.info(
                     f"Gen {entry.generation}: "
@@ -503,13 +548,41 @@ class ImprovementLoop:
         max_tokens: int = 4096,
         persona: str = "",
     ) -> dict:
-        """Call LLM, parse JSON, validate schema, retry once on failure."""
+        """Call LLM, parse JSON, validate schema, retry once on failure.
+
+        Enforces per-generation token budget. Logs evidence of each call.
+        """
+        # Token budget check (rough estimate: 4 chars ≈ 1 token)
+        estimated_input_tokens = (len(system_prompt) + len(user_message)) // 4
+        projected = self._gen_tokens_used + estimated_input_tokens + max_tokens
+        if projected > self._gen_token_budget:
+            logger.warning(
+                f"Token budget exceeded: used={self._gen_tokens_used}, "
+                f"projected={projected}, budget={self._gen_token_budget}"
+            )
+            return {
+                "error": "Token budget exceeded for this generation",
+                "_budget_exceeded": True,
+            }
+
         response = await self.llm.complete(
             system_prompt=system_prompt,
             user_message=user_message,
             temperature=temperature,
             max_tokens=max_tokens,
         )
+
+        # Track token usage (estimate from response length)
+        estimated_output_tokens = len(response) // 4
+        self._gen_tokens_used += estimated_input_tokens + estimated_output_tokens
+
+        # Evidence logging: persist LLM call summary
+        logger.info(
+            f"[evidence] persona={persona or 'unknown'} "
+            f"input_tokens≈{estimated_input_tokens} output_tokens≈{estimated_output_tokens} "
+            f"gen_total≈{self._gen_tokens_used}/{self._gen_token_budget}"
+        )
+
         parsed = self._parse_json_response(response)
 
         if "error" in parsed and "raw" in parsed:
@@ -661,16 +734,44 @@ class ImprovementLoop:
         logger.info(f"Retrospective insights: {json.dumps(retro, indent=2)}")
 
     def _apply_changes(self, implementation: dict) -> None:
-        """Write implementation changes to disk."""
-        for change in implementation.get("changes", []):
-            file_path = self.root / change["file"]
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(change["content"])
+        """Write implementation changes to disk with atomic rollback.
 
-        for test in implementation.get("test_changes", []):
-            test_path = self.root / test["file"]
-            test_path.parent.mkdir(parents=True, exist_ok=True)
-            test_path.write_text(test["content"])
+        Captures existing file contents before writing. If any write fails
+        mid-batch, restores all previously written files to their original state.
+        """
+        all_changes = (
+            implementation.get("changes", []) + implementation.get("test_changes", [])
+        )
+
+        # Snapshot originals for rollback
+        originals: list[tuple[Path, Optional[str]]] = []
+        for change in all_changes:
+            file_path = self.root / change["file"]
+            if file_path.exists():
+                originals.append((file_path, file_path.read_text()))
+            else:
+                originals.append((file_path, None))  # new file — delete on rollback
+
+        # Attempt writes
+        written: list[Path] = []
+        try:
+            for change in all_changes:
+                file_path = self.root / change["file"]
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(change["content"])
+                written.append(file_path)
+        except Exception as write_err:
+            logger.error(f"Write failed at {change.get('file', '?')}: {write_err} — rolling back")
+            for path, original_content in originals:
+                try:
+                    if original_content is None:
+                        if path.exists():
+                            path.unlink()
+                    else:
+                        path.write_text(original_content)
+                except Exception as rb_err:
+                    logger.error(f"Rollback failed for {path}: {rb_err}")
+            raise
 
     def _make_merge_decision(self, pr: PullRequest, comparison: dict) -> bool:
         """Decide whether to merge based on reviews and benchmarks."""

@@ -162,7 +162,7 @@ class BedrockProvider:
 
     def __init__(
         self,
-        model_id: str = "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        model_id: str = "anthropic.claude-sonnet-4-20250514-v1:0",
         region: str = "us-east-1",
     ):
         self.model_id = model_id

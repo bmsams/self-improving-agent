@@ -136,7 +136,7 @@ class AgentCoreMemory:
                 self.client.create_event(
                     memory_id=self._memory_id,
                     actor_id=ACTOR_ID,
-                    session_id=f"gen-{generation}",
+                    session_id=SESSION_ID,
                     messages=[(json.dumps(episode), "assistant")],
                 )
                 logger.info(f"Stored generation {generation} episode to AgentCore Memory")
@@ -165,7 +165,7 @@ class AgentCoreMemory:
                 self.client.create_event(
                     memory_id=self._memory_id,
                     actor_id=ACTOR_ID,
-                    session_id="review-patterns",
+                    session_id=SESSION_ID,
                     messages=[(json.dumps(pattern), "assistant")],
                 )
         except Exception as e:
@@ -313,7 +313,7 @@ print(json.dumps({{
                     from bedrock_agentcore.tools.code_interpreter_client import (
                         CodeInterpreter,
                     )
-                    ci = CodeInterpreter(self.config.region)
+                    ci = self.client if isinstance(self.client, CodeInterpreter) else CodeInterpreter(self.config.region)
                     ci.start(identifier=self.config.code_interpreter_id)
                     response = ci.invoke(
                         "executeCode",
@@ -385,7 +385,7 @@ print(json.dumps(results))
                     from bedrock_agentcore.tools.code_interpreter_client import (
                         CodeInterpreter,
                     )
-                    ci = CodeInterpreter(self.config.region)
+                    ci = self.client if isinstance(self.client, CodeInterpreter) else CodeInterpreter(self.config.region)
                     ci.start(identifier=self.config.code_interpreter_id)
                     response = ci.invoke(
                         "executeCode",

@@ -44,3 +44,8 @@ memory_namespace = "self-improving-agent"
 max_files_per_generation = 10
 blocked_patterns = ["os.system", "subprocess.call", "eval(", "exec("]
 require_tests = true
+
+[limits]
+max_tokens_per_generation = 500000    # Token budget per generation (input + output)
+max_concurrent_subagents = 5          # Max parallel sub-agents per generation
+generation_timeout_seconds = 600      # Max wall-clock seconds per generation

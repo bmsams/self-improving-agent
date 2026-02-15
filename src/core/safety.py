@@ -29,6 +29,10 @@ BLOCKED_PATTERNS = [
 # Files that the agent must never modify
 PROTECTED_FILES = [
     "src/core/safety.py",  # Self-protection
+    "src/core/loop.py",    # Core improvement loop
+    "src/core/models.py",  # Data models / state schema
+    "main.py",             # Entry point
+    "config/agent.toml",   # Agent configuration
 ]
 
 # Methods the agent must never modify

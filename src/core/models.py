@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -188,8 +188,25 @@ class AgentState:
                     else:
                         rebuilt.append(e)
                 data["evolution_log"] = rebuilt
-            # benchmark_history has nested dataclasses; drop and default
-            data.pop("benchmark_history", None)
+            # Reconstruct BenchmarkSuite/BenchmarkResult from dicts
+            if "benchmark_history" in data:
+                rebuilt_suites = []
+                for suite_data in data["benchmark_history"]:
+                    if isinstance(suite_data, dict):
+                        results = []
+                        for r in suite_data.get("results", []):
+                            if isinstance(r, dict):
+                                results.append(BenchmarkResult(
+                                    **{k: v for k, v in r.items()
+                                       if k in BenchmarkResult.__dataclass_fields__}
+                                ))
+                        suite_fields = {
+                            k: v for k, v in suite_data.items()
+                            if k in BenchmarkSuite.__dataclass_fields__ and k != "results"
+                        }
+                        suite_fields["results"] = results
+                        rebuilt_suites.append(BenchmarkSuite(**suite_fields))
+                data["benchmark_history"] = rebuilt_suites
             return cls(**{k: v for k, v in data.items()
                          if k in cls.__dataclass_fields__})
         return cls()
@@ -207,6 +224,11 @@ class AgentConfig:
     auto_merge: bool = False  # If True, merge without human approval
     model_name: str = "claude-sonnet-4-5-20250929"
     log_level: str = "INFO"
+
+    # Per-generation guardrails
+    max_tokens_per_generation: int = 500_000  # Token budget (input + output)
+    generation_timeout_seconds: int = 600     # Wall-clock timeout per generation
+    max_concurrent_subagents: int = 5         # Max parallel sub-agents per generation
 
     # Reviewer weights (for parliament voting)
     reviewer_weights: dict[str, float] = field(default_factory=lambda: {
