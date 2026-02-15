@@ -14,8 +14,6 @@ COPY requirements.txt requirements.txt
 RUN uv pip install -r requirements.txt
 
 
-
-
 RUN uv pip install aws-opentelemetry-distro>=0.10.1
 
 
@@ -36,6 +34,9 @@ EXPOSE 8000
 
 # Copy entire project (respecting .dockerignore)
 COPY . .
+
+# Install this project plus dev + agentcore extras so benchmarks can run in the runtime container.
+RUN uv pip install -e ".[dev,agentcore]"
 
 # Ensure the agent user can modify the working tree.
 RUN chown -R bedrock_agentcore:bedrock_agentcore /app

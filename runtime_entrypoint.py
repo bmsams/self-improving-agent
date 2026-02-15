@@ -48,9 +48,25 @@ def _create_loop():
 
     if provider_name == "bedrock":
         from src.core.providers import BedrockProvider
-        # Many Bedrock Claude models require using an inference profile ID/ARN instead of on-demand model IDs.
+        # Many Bedrock models (including Claude Opus variants) require using an inference profile
+        # (ID or ARN). For convenience we allow either:
+        # - AGENT_MODEL
+        # - BEDROCK_INFERENCE_PROFILE_{ID,ARN}
+        # - BEDROCK_MODEL_ID
+        #
+        # In this account/region, "US Claude Opus 4" is available as:
+        #   us.anthropic.claude-opus-4-20250514-v1:0
+        default_bedrock_model = "us.anthropic.claude-opus-4-20250514-v1:0"
+        bedrock_model_id = (
+            model
+            or os.environ.get("BEDROCK_INFERENCE_PROFILE_ARN")
+            or os.environ.get("BEDROCK_INFERENCE_PROFILE_ID")
+            or os.environ.get("BEDROCK_MODEL_ID")
+            or default_bedrock_model
+        )
+        logger.info("Using Bedrock modelId=%s", bedrock_model_id)
         provider = BedrockProvider(
-            model_id=model or "us.anthropic.claude-opus-4-6-v1",
+            model_id=bedrock_model_id,
             region=os.environ.get("AWS_REGION", "us-east-1"),
         )
     elif provider_name == "mock":
@@ -58,7 +74,7 @@ def _create_loop():
         provider = MockProvider()
     else:
         from src.core.providers import AnthropicProvider
-        provider = AnthropicProvider(model=model or "claude-sonnet-4-5-20250929")
+        provider = AnthropicProvider(model=model or "claude-3-5-sonnet-20240620")
 
     project_root = Path.cwd()
     config = AgentConfig(

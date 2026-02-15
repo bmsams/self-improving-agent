@@ -23,6 +23,40 @@ class GitOps:
         self.remote = remote
         self._ensure_repo()
 
+    # Files/directories that should never be committed as part of a self-improvement PR.
+    # These are runtime artifacts, benchmark outputs, or deployment scaffolding.
+    _EXCLUDE_PATHS: tuple[str, ...] = (
+        ".agent_state.json",
+        ".benchmark_history.json",
+        ".junit-results.xml",
+        ".coverage",
+        "coverage.json",
+        "htmlcov/",
+        "reports/",
+        ".pytest_cache/",
+        ".mypy_cache/",
+        ".ruff_cache/",
+        "__pycache__/",
+        ".bedrock_agentcore.yaml",
+        "infra/cdk.out/",
+        "infra/cdk.out.agentcore/",
+    )
+
+    def _add_all_safely(self) -> None:
+        """Stage changes while excluding runtime artifacts.
+
+        Git's `:(exclude)` pathspec is not supported reliably by `git add` across
+        environments and can cause `git add` to fail if an excluded path is also
+        ignored (it treats it as an explicit add of the ignored file).
+
+        Instead: stage everything, then explicitly unstage excluded paths.
+        """
+        self._run("add", "-A")
+        # Unstage excluded artifacts if they were picked up by the add.
+        for p in self._EXCLUDE_PATHS:
+            # `git reset -- <path>` only touches the index (not the working tree).
+            self._run("reset", "--quiet", "--", p, check=False)
+
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """Execute a git command in the repo directory."""
         result = subprocess.run(
@@ -47,7 +81,7 @@ class GitOps:
             readme = self.repo_path / "README.md"
             if not readme.exists():
                 readme.write_text("# Self-Improving Agent\n\nThis repo evolves itself.\n")
-            self._run("add", "-A")
+            self._add_all_safely()
             self._run("commit", "-m", "[agent] init: bootstrap repository")
 
     @property
@@ -88,7 +122,7 @@ class GitOps:
             for f in files:
                 self._run("add", f)
         else:
-            self._run("add", "-A")
+            self._add_all_safely()
         self._run("commit", "-m", message, check=False)
         return self.current_sha
 

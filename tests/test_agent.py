@@ -1095,8 +1095,8 @@ class TestConfiguration:
     def test_default_settings(self):
         """Default settings have reasonable values."""
         settings = AgentSettings()
-        assert settings.model == "claude-sonnet-4-5-20250929"
-        assert settings.provider == "anthropic"
+        assert settings.model == "us.anthropic.claude-opus-4-20250514-v1:0"
+        assert settings.provider == "bedrock"
         assert settings.max_generations == 100
         assert settings.auto_merge is False
         assert len(settings.benchmarks_enabled) >= 7
@@ -1126,7 +1126,7 @@ class TestConfiguration:
         """Load defaults when no config file exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = load_config(Path(tmpdir))
-            assert settings.model == "claude-sonnet-4-5-20250929"
+            assert settings.model == "us.anthropic.claude-opus-4-20250514-v1:0"
 
     def test_cli_overrides(self):
         """CLI args override file config."""

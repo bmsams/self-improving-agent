@@ -48,21 +48,22 @@ htmlcov/
 .gitattributes
 
 # Documentation
-docs/
-*.md
-!README.md
+# Keep docs/ and markdown in the build context (benchmarks and the agent use them).
 
 # CI/CD
 .github/
 .gitlab-ci.yml
 .travis.yml
 
-# Project specific
-tests/
-
 # CDK output (can contain large/broken paths that break source zipping)
 infra/cdk.out/
 infra/cdk.out.agentcore/
+
+# Agent runtime artifacts (must not be baked into the container image)
+.agent_state.json
+.benchmark_history.json
+.junit-results.xml
+reports/
 
 # Bedrock AgentCore specific - keep config but exclude runtime files
 .bedrock_agentcore.yaml

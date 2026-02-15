@@ -222,7 +222,8 @@ class AgentConfig:
     review_consensus_threshold: float = 0.6  # % of reviewers that must approve
     max_retries_per_pr: int = 3
     auto_merge: bool = False  # If True, merge without human approval
-    model_name: str = "claude-sonnet-4-5-20250929"
+    # Used for local/dev defaults; runtime_entrypoint sets provider/model explicitly.
+    model_name: str = "us.anthropic.claude-opus-4-20250514-v1:0"
     log_level: str = "INFO"
 
     # Per-generation guardrails

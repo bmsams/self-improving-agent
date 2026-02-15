@@ -1,6 +1,8 @@
 # Agent runtime files
 .agent_state.json
 .benchmark_history.json
+.junit-results.xml
+reports/
 
 # Secrets
 .env
@@ -16,6 +18,9 @@ coverage.json
 *.egg-info/
 dist/
 build/
+infra/cdk.out/
+infra/cdk.out.agentcore/
+.bedrock_agentcore.yaml
 
 # IDE
 .vscode/

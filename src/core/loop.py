@@ -603,7 +603,64 @@ class ImprovementLoop:
         if persona:
             parsed = self._validate_response_schema(parsed, persona)
 
+            # If the JSON parses but does not match the expected schema, run a focused repair pass.
+            # This is the main cause of `invalid-plan` runs: the persona prompt and schema drift.
+            if isinstance(parsed, dict) and parsed.get("_schema_error"):
+                logger.info(f"Schema validation failed for persona={persona} — retrying with schema repair")
+                schema = self._schema_requirements_for_persona(persona)
+                repair_msg = (
+                    "Your previous response did not match the required JSON schema.\n"
+                    "Return ONLY valid JSON that matches this schema exactly.\n\n"
+                    f"Required schema:\n{schema}\n\n"
+                    f"Original request:\n{user_message}\n\n"
+                    "Previous JSON (for reference):\n"
+                    f"{json.dumps(parsed, indent=2, default=str)}"
+                )
+                response = await self.llm.complete(
+                    system_prompt=system_prompt,
+                    user_message=repair_msg,
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                )
+                repaired = self._parse_json_response(response)
+                parsed = self._validate_response_schema(repaired, persona)
+
         return parsed
+
+    @staticmethod
+    def _schema_requirements_for_persona(persona: str) -> str:
+        """Human-readable schema used for repair prompts."""
+        if persona == "architect":
+            return (
+                "{\n"
+                '  "improvement_type": "feat|fix|refactor|perf|docs",\n'
+                '  "title": "string",\n'
+                '  "rationale": "string",\n'
+                '  "files_to_modify": [{"path": "string", "action": "create|modify|delete"}],\n'
+                '  "expected_benchmark_impact": {"benchmark_name": number},\n'
+                '  "requirements": [{"id": "REQ-001", "text": "THE system SHALL...", "priority": "must|should|may"}],\n'
+                '  "design": {"approach": "string", "components": ["string"], "data_flow": "string"},\n'
+                '  "tasks": [{"id": "TASK-001", "title": "string", "depends_on": ["TASK-000"], "effort": "S|M|L"}]\n'
+                "}"
+            )
+        if persona == "builder":
+            return (
+                "{\n"
+                '  "changes": [{"file": "string", "content": "string"}],\n'
+                '  "test_changes": [{"file": "string", "content": "string"}]\n'
+                "}"
+            )
+        if persona == "reviewer":
+            return (
+                "{\n"
+                '  "approved": boolean,\n'
+                '  "score": number,\n'
+                '  "summary": "string",\n'
+                '  "findings": [{"severity":"critical|high|medium|low|info","category":"security|performance|correctness|style|architecture|testing","file_path":"string","line_start":number,"line_end":number,"description":"string","suggestion":"string","auto_fixable":boolean}],\n'
+                '  "merge_recommendation": "approve|request_changes|reject"\n'
+                "}"
+            )
+        return "{}"
 
     async def _plan_improvement(self, baseline: BenchmarkSuite) -> dict:
         """Use Architect persona to plan the next improvement (no memory)."""
@@ -946,13 +1003,13 @@ class ImprovementLoop:
             required = {"title", "files_to_modify"}
             if not required.issubset(data.keys()):
                 logger.warning(f"Architect response missing keys: {required - data.keys()}")
-                return {
-                    "title": data.get("title", "invalid-plan"),
-                    "files_to_modify": data.get("files_to_modify", []),
-                    "improvement_type": data.get("improvement_type", "unknown"),
-                    "rationale": data.get("rationale", "Schema validation failed"),
-                    "_schema_error": True,
-                }
+                fixed = dict(data)
+                fixed.setdefault("title", "invalid-plan")
+                fixed.setdefault("files_to_modify", [])
+                fixed.setdefault("improvement_type", "unknown")
+                fixed.setdefault("rationale", "Schema validation failed")
+                fixed["_schema_error"] = True
+                return fixed
 
         elif persona == "builder":
             if "changes" not in data or not isinstance(data.get("changes"), list):

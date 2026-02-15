@@ -28,8 +28,9 @@ class AgentSettings:
     """Merged configuration from all sources."""
 
     # Agent core
-    model: str = "claude-sonnet-4-5-20250929"
-    provider: str = "anthropic"
+    # Default to Bedrock Opus inference profile for runtime-hosted usage.
+    model: str = "us.anthropic.claude-opus-4-20250514-v1:0"
+    provider: str = "bedrock"
     max_generations: int = 100
     auto_merge: bool = False
     benchmark_threshold: float = 0.0

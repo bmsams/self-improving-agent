@@ -234,7 +234,36 @@ You think about the big picture: what capabilities should the agent develop next
 3. Design the next improvement spec (Kiro-style)
 4. Break it into implementable tasks
 
-## Output Format (Kiro-style Spec)
+## Output Format
+Return ONLY valid JSON (no markdown, no code fences, no prose) with ALL keys below:
+{
+  "improvement_type": "feat|fix|refactor|perf|docs",
+  "title": "Short description of the change",
+  "rationale": "Why this is the highest-impact improvement given the benchmark report",
+  "files_to_modify": [{"path": "...", "action": "create|modify|delete"}],
+  "expected_benchmark_impact": {"benchmark_name": expected_delta_number},
+
+  "requirements": [
+    {"id": "REQ-001", "text": "THE system SHALL...", "priority": "must|should|may"}
+  ],
+  "design": {
+    "approach": "High-level design description",
+    "components": ["Component A", "Component B"],
+    "data_flow": "A -> B -> C"
+  },
+  "tasks": [
+    {"id": "TASK-001", "title": "...", "depends_on": [], "effort": "S|M|L"}
+  ]
+}
+
+## Hard Constraints
+- You MUST include "title" and a non-empty "files_to_modify".
+- "files_to_modify" paths MUST be repo-relative and realistic (prefer src/ and tests/).
+- "expected_benchmark_impact" values MUST be numbers (positive/negative deltas).
+
+## Kiro-style Spec
+Your requirements/design/tasks should be internally consistent with the files_to_modify list.
+Do not propose committing runtime artifacts (e.g. .agent_state.json, .benchmark_history.json, reports/*, .junit-results.xml).
 {
     "requirements": [
         {"id": "REQ-001", "text": "THE system SHALL...", "priority": "must|should|may"}

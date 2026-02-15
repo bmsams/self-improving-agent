@@ -70,7 +70,7 @@ class AnthropicProvider:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = "claude-3-5-sonnet-20240620",
     ):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.model = model
@@ -162,7 +162,7 @@ class BedrockProvider:
 
     def __init__(
         self,
-        model_id: str = "anthropic.claude-sonnet-4-20250514-v1:0",
+        model_id: str = "us.anthropic.claude-opus-4-20250514-v1:0",
         region: str = "us-east-1",
     ):
         self.model_id = model_id
